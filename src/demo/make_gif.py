@@ -6,7 +6,7 @@ from PIL import Image
 # ----------------------------
 # User settings
 # ----------------------------
-run_dir = "runs/hod_maxN_jax_reparam"     # folder with catalog_step_*.npz
+run_dir = "../scripts/runs/hod_maxN_jax_reparam"     # folder with catalog_step_*.npz
 pattern = "catalog_step_*.npz"
 out_gif = "scatter_evolution.gif"
 fps = 12                      # smoother playback
@@ -16,8 +16,8 @@ lock_axes = True              # keep fixed bounds across frames
 point_size = 1.0
 alpha = 0.04                  # a bit softer for dense fields
 color = "darkred"
-figsize = (6.0, 6.0)
-dpi = 150
+figsize = (4.0, 4.0)
+dpi = 100
 # ----------------------------
 
 # sort files by numeric step
