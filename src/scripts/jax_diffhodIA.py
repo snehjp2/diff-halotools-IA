@@ -52,8 +52,8 @@ def _erfi_real(x: Array) -> Array:
     Stable real-valued erfi for JAX arrays.
     Matches your piecewise series/asymptotic form, with bounded iteration counts.
     """
-    x64 = x.astype(jnp.float64)
-    ax = jnp.abs(x64)
+    # x64 = x.astype(jnp.float64)
+    # ax = jnp.abs(x64)
 
     def small_branch(xs: Array) -> Array:
         # Series: erfi(x) = 2/sqrt(pi) * sum_{n>=0} x^{2n+1} / (n! (2n+1))
@@ -75,9 +75,9 @@ def _erfi_real(x: Array) -> Array:
         series = 1.0 + 0.5 * inv2 + 0.75 * inv2 * inv2 + 1.875 * inv2 * inv2 * inv2
         return jnp.exp(xl * xl) * series / (math.sqrt(math.pi) * xl)
 
-    y_small = small_branch(x64)
-    y_large = large_branch(x64)
-    y = jnp.where(ax <= 3.0, y_small, y_large)
+    y_small = small_branch(x)
+    y_large = large_branch(x)
+    y = jnp.where(jnp.abs(x) <= 3.0, y_small, y_large)
     return y.astype(x.dtype)
 
 
@@ -230,7 +230,7 @@ def sample_centrals_diffhod(key, mean_N_cen, *, relaxed: bool = True, tau: float
     return lax.cond(pred, relaxed_branch, discrete_branch, operand=None)
 
 
-@partial(jax.jit, static_argnames=("N_max",))
+@partial(jit, static_argnames=("N_max",))
 def sample_satellites_diffhod(
     key: jnp.ndarray,
     mean_N_sat: jnp.ndarray,
@@ -273,56 +273,76 @@ def sample_satellites_diffhod(
     return lax.cond(pred, relaxed_branch, discrete_branch, operand=None)
 
 
-# -------------------- NFW sampling about hosts --------------------
-# @jit
-# @partial(jit, static_argnames=('n_newton',))
+@partial(jax.jit, static_argnames=("n_newton", "per_host_cap"))
 def sample_nfw_about_hosts(
     key: Array,
-    host_centers: Array,
-    host_rvir: Array,
-    counts_per_host: Array,
+    host_centers: Array,         # [H, 3]
+    host_rvir: Array,            # [H]
+    counts_per_host: Array,      # [H], int-like
     *,
     conc: float = 5.0,
     n_newton: int = 6,
-) -> Tuple[Array, Array]:
+    per_host_cap: int = 64,      # STATIC: max draws per host
+):
     """
     Vectorized NFW radii via inverse CDF with fixed Newton iters.
-    Returns:
-      pos: [total, 3], host_idx: [total]
+
+    Returns fixed-shape outputs plus a mask:
+      pos_full:   [H*per_host_cap, 3]
+      host_idx:   [H*per_host_cap]
+      use_mask:   [H*per_host_cap]  (True for the first 'counts_per_host[h]' of each host h)
     """
-    conc = jnp.asarray(conc, dtype=host_centers.dtype)
-    conc = jnp.maximum(conc, jnp.asarray(1e-8, dtype=host_centers.dtype))
+    H = host_centers.shape[0]
+    dtype = host_centers.dtype
 
-    counts = jnp.clip(counts_per_host, 0).astype(jnp.int32)
-    total = int(jnp.sum(counts))  # make concrete for non-jitted path
+    conc = jnp.asarray(conc, dtype=dtype)
+    conc = jnp.maximum(conc, jnp.asarray(1e-8, dtype=dtype))
 
-    if total == 0:
-        return jnp.zeros((0, 3), host_centers.dtype), jnp.zeros((0,), jnp.int32)
+    # Cap requested counts to per_host_cap so the mask is always valid.
+    counts = jnp.clip(counts_per_host.astype(jnp.int32), 0, per_host_cap)
 
-    host_ids = jnp.arange(host_centers.shape[0], dtype=jnp.int32)
-    host_idx = jnp.repeat(host_ids, counts)  # [total]
-    rvir = host_rvir[host_idx]
-    rs = rvir / conc
+    # Build static index grids
+    host_ids   = jnp.arange(H, dtype=jnp.int32)                      # [H]
+    host_idx   = jnp.repeat(host_ids, per_host_cap)                  # [H*K]
+    # idx_in_host= jnp.tile(jnp.arange(per_host_cap, jnp.int32), (H,)) # [H*K]
+    # Option A: minimal fix
+    idx_in_host = jnp.tile(jnp.arange(per_host_cap, dtype=jnp.int32), (H,))  # [H*K]
 
+
+    # Mask: keep only first counts[h] samples within each host
+    use_mask = idx_in_host < counts[host_idx]                        # [H*K], bool
+
+    # Per-sample parameters
+    rvir = host_rvir[host_idx]                                       # [H*K]
+    rs   = rvir / conc                                               # [H*K]
+
+    # RNG
     key_u, key_dir = random.split(key)
-    u = jnp.clip(random.uniform(key_u, (total,)), 1e-7, 1 - 1e-7)
+
+    # Draw uniforms/normals for the full static size (masked later)
+    u  = jnp.clip(random.uniform(key_u, (H * per_host_cap,), dtype=dtype), 1e-7, 1 - 1e-7)
     mc = jnp.log1p(conc) - conc / (1 + conc)
-    y = u * mc
+    y  = u * mc
+    x0 = conc * u
 
-    x = conc * u
-
+    # Newton iterations (vectorized, fixed count)
     def body_fun(_, x_curr):
-        fx = jnp.log1p(x_curr) - x_curr / (1 + x_curr) - y
+        fx  = jnp.log1p(x_curr) - x_curr / (1 + x_curr) - y
         dfx = x_curr / jnp.square(1 + x_curr)
         return jnp.clip(x_curr - fx / (dfx + 1e-30), 0.0)
 
-    x_fin = lax.fori_loop(0, n_newton, body_fun, x)
-    r = x_fin * rs
+    x_fin = lax.fori_loop(0, n_newton, body_fun, x0)
+    r     = x_fin * rs                                              # [H*K]
 
-    z = random.normal(key_dir, (total, 3))
-    z = _unitize(z)
-    pos = host_centers[host_idx] + r[:, None] * z
-    return pos, host_idx
+    # Random directions
+    z = random.normal(key_dir, (H * per_host_cap, 3), dtype=dtype)
+    z = z / (jnp.linalg.norm(z, axis=-1, keepdims=True) + 1e-12)    # _unitize
+
+    pos_full = host_centers[host_idx] + r[:, None] * z              # [H*K, 3]
+
+    # Return fixed-shape arrays + mask (caller can slice with the mask or carry it forward)
+    return pos_full, host_idx, use_mask
+
 
 
 # -------------------- per-host softmax over ranks --------------------
@@ -697,9 +717,18 @@ class DiffHalotoolsIA:
 
             if self.do_nfw_fallback:
                 k4, self.key = random.split(self.key)
-                nfw_pts, nfw_host_idx = sample_nfw_about_hosts(
-                    k4, self.host_pos, self.host_rvir, deficit, conc=5.0
-                )
+                # nfw_pts, nfw_host_idx = sample_nfw_about_hosts(
+                #     k4, self.host_pos, self.host_rvir, deficit, conc=5.0
+                # )
+                pos_full, host_idx_full, use_mask = sample_nfw_about_hosts(
+                    k4, self.host_pos, self.host_rvir, deficit,
+                conc=5.0, n_newton=6, per_host_cap=64
+            )
+
+                # If you need ragged outputs *outside* jit:
+                nfw_pts     = pos_full[use_mask]
+                nfw_host_idx= host_idx_full[use_mask]
+
                 if nfw_pts.shape[0] > 0:
                     disp = nfw_pts - self.host_pos[nfw_host_idx]
                     r_hat = _unitize(disp)
@@ -804,7 +833,7 @@ if __name__ == "__main__":
         ]
     ]
 
-    idx = 1
+    idx = 0
     params = jnp.asarray(inputs[idx], dtype=jnp.float32)
     original_catalog = catalog[idx]
 
@@ -887,3 +916,55 @@ if __name__ == "__main__":
 #     Kh_hard = jnp.sum(z_hard, axis=1).astype(jnp.int32)
 #     Kh_st = Kh_hard.astype(jnp.float32) + (Kh_soft - lax.stop_gradient(Kh_soft))
 #     return Kh_hard, Kh_st
+
+
+# -------------------- NFW sampling about hosts --------------------
+# @jit
+# @partial(jit, static_argnames=('n_newton',))
+# def sample_nfw_about_hosts(
+#     key: Array,
+#     host_centers: Array,
+#     host_rvir: Array,
+#     counts_per_host: Array,
+#     *,
+#     conc: float = 5.0,
+#     n_newton: int = 6,
+# ) -> Tuple[Array, Array]:
+#     """
+#     Vectorized NFW radii via inverse CDF with fixed Newton iters.
+#     Returns:
+#       pos: [total, 3], host_idx: [total]
+#     """
+#     conc = jnp.asarray(conc, dtype=host_centers.dtype)
+#     conc = jnp.maximum(conc, jnp.asarray(1e-8, dtype=host_centers.dtype))
+
+#     counts = jnp.clip(counts_per_host, 0).astype(jnp.int32)
+#     total = jnp.sum(counts).astype(jnp.int32)
+    
+#     # if total == 0:
+#     #     return jnp.zeros((0, 3), host_centers.dtype), jnp.zeros((0,), jnp.int32)
+
+#     host_ids = jnp.arange(host_centers.shape[0], dtype=jnp.int32)
+#     host_idx = jnp.repeat(host_ids, counts)  # [total]
+#     rvir = host_rvir[host_idx]
+#     rs = rvir / conc
+
+#     key_u, key_dir = random.split(key)
+#     u = jnp.clip(random.uniform(key_u, (total,)), 1e-7, 1 - 1e-7)
+#     mc = jnp.log1p(conc) - conc / (1 + conc)
+#     y = u * mc
+
+#     x = conc * u
+
+#     def body_fun(_, x_curr):
+#         fx = jnp.log1p(x_curr) - x_curr / (1 + x_curr) - y
+#         dfx = x_curr / jnp.square(1 + x_curr)
+#         return jnp.clip(x_curr - fx / (dfx + 1e-30), 0.0)
+
+#     x_fin = lax.fori_loop(0, n_newton, body_fun, x)
+#     r = x_fin * rs
+
+#     z = random.normal(key_dir, (total, 3))
+#     z = _unitize(z)
+#     pos = host_centers[host_idx] + r[:, None] * z
+#     return pos, host_idx
