@@ -2,17 +2,24 @@
 import csv
 import json
 import os
+import sys
 import time
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+
+sys.path.append(
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts"))
+)
 from diffhodIA_utils import load_cleaned_catalogs_from_h5, mask_bad_halocat
 from halotools.sim_manager import CachedHaloCatalog
 
 # Your JAX builder
 from jax_diffhodIA import DiffHalotoolsIA
+
+jax.config.update("jax_enable_x64", True)  # better numeric headroom
 
 
 # ---------- logger ----------
@@ -218,7 +225,8 @@ for step in range(num_steps):
         do_discrete=True,
         do_nfw_fallback=True,
         seed=base_seed,
-        satellite_alignment="radial",
+        alignment_model="radial",
+        alignment_strength="radial",
         relaxed=True,
         tau=float(tau),
         Nmax_sat=48,

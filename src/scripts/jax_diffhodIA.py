@@ -2,20 +2,47 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from functools import partial
 from typing import Optional, Tuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from diffhodIA_utils import load_cleaned_catalogs_from_h5, mask_bad_halocat, plot_diagnostic
-from jax import jit, lax, random
+from diffhodIA_utils import (
+    load_cleaned_catalogs_from_h5,
+    mask_bad_halocat,
+    plot_diagnostic,
+)
+from jax import config, jit, lax, random
 from jax.nn import sigmoid
+
+# config.update("jax_enable_x64", True)      # better numeric headroom
+# config.update("jax_debug_nans", True)  # crash when a NaN is created
+# config.update("jax_debug_infs", True)  # ditto for infs
+
 
 Array = jnp.ndarray
 
 
-# -------------------- small helpers --------------------
+def dbg(name, x):
+    jax.debug.print(
+        "{name}: shape={s}, any_nan={nan}, any_inf={inf}, min={mn}, max={mx}",
+        name=name,
+        s=x.shape,
+        nan=jnp.isnan(x).any(),
+        inf=~jnp.isfinite(x).all(),
+        mn=jnp.nanmin(x),
+        mx=jnp.nanmax(x),
+    )
+
+
+@jit
 def _unitize(v: Array, eps: float = 1e-12) -> Array:
+    """
+    Normalize a tensor to have unit length.
+    v: [N, 3] tensor
+    Returns: [N, 3] tensor of unit vectors
+    """
     return v / (jnp.linalg.norm(v, axis=-1, keepdims=True) + eps)
 
 
@@ -54,7 +81,7 @@ def _erfi_real(x: Array) -> Array:
     return y.astype(x.dtype)
 
 
-@jax.jit
+@jit
 def _sample_t_watson(key: Array, kappa: Array, u: Array, n_newton: int = 6) -> Array:
     eps = 1e-12
 
@@ -83,7 +110,6 @@ def _sample_t_watson(key: Array, kappa: Array, u: Array, n_newton: int = 6) -> A
 
             return lax.fori_loop(0, n_newton, body, tp0)
 
-        # k_i < 0 ? (neg) : k_i > 0 ? (pos) : (zero)
         return lax.cond(
             k_i < -1e-12,
             neg_branch,
@@ -102,26 +128,34 @@ def sample_watson_orientations(
     """
     Dimroth–Watson axial samples about ref_dirs (unit vectors).
     """
+    # jax.debug.print("ref dirs = {}", ref_dirs)
+    # jax.debug.print("watson.mu.in = {}", mu)
+
     u_axis = _unitize(ref_dirs)
+    # jax.debug.print("watson.u_axis = {}", u_axis)
     N = u_axis.shape[0]
     mu_arr = jnp.asarray(mu, dtype=u_axis.dtype)
+
     if mu_arr.ndim == 0:
         mu = jnp.full((N,), mu_arr, dtype=u_axis.dtype)
     else:
         mu = mu_arr.reshape(-1)
         if mu.shape[0] == 1:
             mu = jnp.repeat(mu, N, axis=0)
+
     mu = jnp.clip(mu, -1.0 + 1e-6, 1.0 - 1e-6)
 
     kappa = jnp.tan(0.5 * math.pi * mu)
+    kappa = jnp.clip(kappa, -1e6, 1e6)
+
     key_u, key_phi = random.split(key)
 
     u_uni = jnp.clip(
         random.uniform(key_u, (N,), minval=0.0, maxval=1.0), 1e-7, 1 - 1e-7
     )
     t = _sample_t_watson(key_u, kappa, u_uni, n_newton=n_newton)
+    # jax.debug.print("watson.t = {}", t)
 
-    # Build orthonormal basis around u_axis
     xhat = jnp.broadcast_to(
         jnp.array([1.0, 0.0, 0.0], dtype=u_axis.dtype), u_axis.shape
     )
@@ -137,6 +171,7 @@ def sample_watson_orientations(
     costh = t.reshape(N, 1)
 
     n = _unitize(costh * u_axis + sinth * (jnp.cos(phi) * b1 + jnp.sin(phi) * b2))
+    # jax.debug.print("watson.n = {}", n)
     return n
 
 
@@ -165,76 +200,82 @@ def Nsat(
     return Ncen(M, logMmin, sigma_logM) * jnp.power(x, alpha)
 
 
-# -------------------- relaxed/binary samplers --------------------
 @jit
 def _logit(p: Array) -> Array:
-    return jnp.log(p + 1e-8) - jnp.log1p(-p + 1e-8)
+    p = jnp.nan_to_num(p, nan=0.5, posinf=1.0, neginf=0.0)
+    p = jnp.clip(p, 1e-6, 1.0 - 1e-6)
+    return jnp.log(p) - jnp.log1p(-p)  # now safe
 
 
-# @partial(jit(static_argnames=('relaxed',)))
-def sample_centrals_diffhod(
-    key: Array, mean_N_cen: Array, *, relaxed: bool = True, tau: float = 0.1
-) -> Tuple[Array, Array]:
-    """
-    Bernoulli or Relaxed Bernoulli (Gumbel-Logistic) + straight-through.
-    Returns (hard_0_1, straight_through)
-    """
+@jit
+def sample_centrals_diffhod(key, mean_N_cen, *, relaxed: bool = True, tau: float = 0.1):
     p = jnp.clip(mean_N_cen, 0.0, 1.0)
-    if not relaxed:
-        u = random.uniform(key, p.shape)
-        Hc = (u < p).astype(p.dtype)
+    dtype = p.dtype
+    tau = jnp.asarray(tau, dtype=dtype)
+    pred = jnp.asarray(relaxed, dtype=bool)  # supports Python bool or scalar JAX bool
+
+    def discrete_branch(_):
+        u = random.uniform(key, p.shape, dtype=dtype)
+        Hc = (u < p).astype(dtype)
         return Hc, Hc
 
-    # relaxed
-    key_u = key
-    u = jnp.clip(random.uniform(key_u, p.shape), 1e-6, 1 - 1e-6)
-    eps_logistic = jnp.log(u) - jnp.log1p(-u)
-    z = sigmoid((_logit(p) + eps_logistic) / tau)
-    z_hard = (z >= 0.5).astype(z.dtype)
-    z_st = z_hard + (z - lax.stop_gradient(z))
-    return z_hard, z_st
+    def relaxed_branch(_):
+        u = jnp.clip(random.uniform(key, p.shape, dtype=dtype), 1e-6, 1 - 1e-6)
+        eps_logistic = jnp.log(u) - jnp.log1p(-u)
+        z = jax.nn.sigmoid((_logit(p).astype(dtype) + eps_logistic) / tau)
+        z_hard = (z >= 0.5).astype(dtype)
+        z_st = z_hard + (z - lax.stop_gradient(z))
+        return z_hard, z_st
+
+    return lax.cond(pred, relaxed_branch, discrete_branch, operand=None)
 
 
-# @partial(jit(static_argnames=('relaxed',)))
+@partial(jax.jit, static_argnames=("N_max",))
 def sample_satellites_diffhod(
-    key: Array,
-    mean_N_sat: Array,
+    key: jnp.ndarray,
+    mean_N_sat: jnp.ndarray,
     *,
-    N_max: int = 48,
-    relaxed: bool = True,
+    N_max: int = 48,  # must be static for JAX (used in shapes)
+    relaxed: bool = True,  # also static here; we still branch via lax.cond
     tau: float = 0.1,
-) -> Tuple[Array, Array]:
+) -> tuple[jnp.ndarray, jnp.ndarray]:
     """
     Binomial(N_max, p=lambda/N_max) via N_max independent (relaxed) Bernoullis.
-    Returns (hard_counts:int, straight_through:float)
+    Returns (hard_counts:int32, straight_through:float32)
     """
+    # keep dtype consistent with inputs (usually float32)
     lam = jnp.clip(mean_N_sat, 0.0)
-    p = jnp.clip(lam / float(N_max), 0.0, 1.0)
+    invN = jnp.asarray(1.0 / N_max, dtype=lam.dtype)  # avoid float(N_max)
+    p = jnp.clip(lam * invN, 0.0, 1.0)
 
-    if not relaxed:
-        key_u = key
-        u = random.uniform(key_u, (p.shape[0], N_max))
+    H = p.shape[0]
+    pred = jnp.asarray(relaxed, dtype=bool)
+
+    def discrete_branch(_):
+        u = random.uniform(key, (H, N_max), dtype=lam.dtype)
         trials = jnp.sum(u < p[:, None], axis=1)
         Kh = trials.astype(jnp.int32)
         return Kh, Kh.astype(jnp.float32)
 
-    # relaxed independent trials
-    key_u = key
-    u = jnp.clip(random.uniform(key_u, (p.shape[0], N_max)), 1e-6, 1 - 1e-6)
-    eps = jnp.log(u) - jnp.log1p(-u)
-    logits = _logit(p)[:, None]
-    z = sigmoid((logits + eps) / tau)  # [H, N_max]
-    z_hard = (z >= 0.5).astype(z.dtype)
-    z_st = z_hard + (z - lax.stop_gradient(z))
-    Kh_soft = jnp.sum(z, axis=1)
-    Kh_hard = jnp.sum(z_hard, axis=1).astype(jnp.int32)
-    Kh_st = Kh_hard.astype(jnp.float32) + (Kh_soft - lax.stop_gradient(Kh_soft))
-    return Kh_hard, Kh_st
+    def relaxed_branch(_):
+        u = random.uniform(key, (H, N_max), dtype=lam.dtype)
+        u = jnp.clip(u, 1e-6, 1.0 - 1e-6)
+        eps = jnp.log(u) - jnp.log1p(-u)
+        logits = _logit(p).astype(lam.dtype)[:, None]  # ensure dtype matches
+        z = sigmoid((logits + eps) / jnp.asarray(tau, lam.dtype))  # [H, N_max]
+        z_hard = (z >= 0.5).astype(z.dtype)
+        z_st = z_hard + (z - lax.stop_gradient(z))
+        Kh_soft = jnp.sum(z, axis=1)
+        Kh_hard = jnp.sum(z_hard, axis=1).astype(jnp.int32)
+        Kh_st = Kh_hard.astype(jnp.float32) + (Kh_soft - lax.stop_gradient(Kh_soft))
+        return Kh_hard, Kh_st
+
+    return lax.cond(pred, relaxed_branch, discrete_branch, operand=None)
 
 
 # -------------------- NFW sampling about hosts --------------------
 # @jit
-# @partial(jax.jit, static_argnames=('n_newton',))
+# @partial(jit, static_argnames=('n_newton',))
 def sample_nfw_about_hosts(
     key: Array,
     host_centers: Array,
@@ -282,8 +323,6 @@ def sample_nfw_about_hosts(
     z = _unitize(z)
     pos = host_centers[host_idx] + r[:, None] * z
     return pos, host_idx
-
-    # return lax.cond(total == 0, empty, nonempty)
 
 
 # -------------------- per-host softmax over ranks --------------------
@@ -355,7 +394,6 @@ def per_host_softmax_over_ranks(
     )
     max_per_pos = max_per_pos_rev[::-1]
 
-    # Softmax with per-block SUM via forward run+backward propagate
     exp_shift = jnp.exp(logits_sorted - max_per_pos)
 
     def run_sum(carry, inp):
@@ -385,6 +423,13 @@ def per_host_softmax_over_ranks(
     return q  # sums to 1 per host
 
 
+def _satellite_mu_from_radius(r_over_rvir: Array, a: float, gamma: float) -> Array:
+    r_safe = jnp.nan_to_num(r_over_rvir, nan=0.0, posinf=1e3, neginf=0.0)
+    r_clipped = jnp.clip(r_safe, 1e-5, 1e3)  # avoid negatives / zero
+    mu = a * jnp.power(r_clipped, gamma)
+    return jnp.clip(mu, -0.999, 0.999)  # stay far from ±1
+
+
 # -------------------- main builder --------------------
 @dataclass
 class DiffHalotoolsIA:
@@ -398,7 +443,10 @@ class DiffHalotoolsIA:
     params: Array  # shape (7,)
     do_discrete: bool = True
     do_nfw_fallback: bool = True
-    satellite_alignment: str = "radial"  # or "subhalo"
+    alignment_model: str = "radial"  # or "subhalo"
+    alignment_strength: str = "constant"
+    a_strength: float = 0.8
+    gamma_strength: float = 1.0
     relaxed: bool = True
     tau: float = 0.1
     Nmax_sat: int = 256
@@ -426,6 +474,9 @@ class DiffHalotoolsIA:
         missing = [k for k in req if k not in self.subcat.colnames]
         if missing:
             raise KeyError(f"subcat missing required keys: {missing}")
+        
+        if self.alignment_strength.lower() == 'radial':
+            config.update("jax_enable_x64", True)      # better numeric headroom
 
         halo_id = np.asarray(self.subcat["halo_id"], dtype=np.int64)
         halo_upid = np.asarray(self.subcat["halo_upid"], dtype=np.int64)
@@ -500,6 +551,10 @@ class DiffHalotoolsIA:
 
         self.host_axis = _unitize(host_axis)
         self.sub_axis = _unitize(sub_axis)
+        self.alignment_model = self.alignment_model.lower()
+        self.alignment_strength = self.alignment_strength.lower()
+        self.a_strength = float(self.a_strength)
+        self.gamma_strength = float(self.gamma_strength)
 
         if self.host_pos.size == 0:
             raise ValueError("No host halos found after filtering (halo_upid == -1).")
@@ -612,17 +667,33 @@ class DiffHalotoolsIA:
             )[0]
             chosen_sub_idx = chosen_sub_idx[chosen_sub_idx >= 0]
 
-            if self.satellite_alignment == "subhalo":
+            if self.alignment_model == "subhalo":
                 ref_s_sub = self.sub_axis[chosen_sub_idx]
             else:
                 # radial: from host center to sub position
                 base = self.sub_pos - self.host_pos[self.sub_host_ids]
-                ref_base = _unitize(base)[chosen_sub_idx]
+                ref_s_sub = _unitize(base)[chosen_sub_idx]
 
-                ref_s_sub = ref_base
+            if self.alignment_strength == "constant":
+                mu_sub = jnp.full(
+                    (ref_s_sub.shape[0],), float(mu_sat), dtype=ref_s_sub.dtype
+                )
+            else:
+                # radius for each chosen subhalo relative to its host
+                base_vec = (self.sub_pos - self.host_pos[self.sub_host_ids])[
+                    chosen_sub_idx
+                ]
+                r = jnp.linalg.norm(base_vec, axis=1)
+                rvir_sel = self.host_rvir[self.sub_host_ids[chosen_sub_idx]]
+                r_over = r / (rvir_sel + 1e-12)
+                mu_sub = _satellite_mu_from_radius(
+                    r_over, float(self.a_strength), float(self.gamma_strength)
+                )
 
             k3, self.key = random.split(self.key)
-            ori_sat_sub = sample_watson_orientations(k3, ref_s_sub, mu_sat)
+            mu_sub = jnp.nan_to_num(mu_sub, nan=0.0)
+            mu_sub = jnp.clip(mu_sub, -0.999, 0.999)
+            ori_sat_sub = sample_watson_orientations(k3, ref_s_sub, mu_sub)
 
             if self.do_nfw_fallback:
                 k4, self.key = random.split(self.key)
@@ -630,11 +701,27 @@ class DiffHalotoolsIA:
                     k4, self.host_pos, self.host_rvir, deficit, conc=5.0
                 )
                 if nfw_pts.shape[0] > 0:
-                    r_hat = _unitize(nfw_pts - self.host_pos[nfw_host_idx])
+                    disp = nfw_pts - self.host_pos[nfw_host_idx]
+                    r_hat = _unitize(disp)
+
+                    # alignment strength for fallback points
+                    if self.alignment_strength == "constant":
+                        mu_nfw = jnp.full(
+                            (r_hat.shape[0],), float(mu_sat), dtype=r_hat.dtype
+                        )
+                    else:
+                        r = jnp.linalg.norm(disp, axis=1)
+                        rvir_sel = self.host_rvir[nfw_host_idx]
+                        r_over = r / (rvir_sel + 1e-12)
+                        mu_nfw = _satellite_mu_from_radius(
+                            r_over, float(self.a_strength), float(self.gamma_strength)
+                        )
+
                     k5, self.key = random.split(self.key)
-                    ori_sat_nfw = sample_watson_orientations(k5, r_hat, mu_sat)
+                    ori_sat_nfw = sample_watson_orientations(k5, r_hat, mu_nfw)
                 else:
                     ori_sat_nfw = nfw_pts  # empty
+
                 cat_sat = jnp.concatenate([cat_sat_sub, nfw_pts], axis=0)
                 ori_sat = jnp.concatenate([ori_sat_sub, ori_sat_nfw], axis=0)
             else:
@@ -647,13 +734,31 @@ class DiffHalotoolsIA:
             # "soft" satellites: expand by rounded expected allocations (diagnostics)
             k_soft = jnp.rint(sat_w).astype(jnp.int32)
             cat_sat = jnp.repeat(self.sub_pos, k_soft, axis=0)
-            if self.satellite_alignment == "subhalo":
+            if self.alignment_model == "subhalo":
                 ref_s_sub = jnp.repeat(self.sub_axis, k_soft, axis=0)
             else:
                 base = self.sub_pos - self.host_pos[self.sub_host_ids]
                 ref_s_sub = jnp.repeat(_unitize(base), k_soft, axis=0)
+
+            # compute per-satellite mu for the repeated selection
+            if self.alignment_strength == "constant":
+                mu_soft = jnp.full(
+                    (ref_s_sub.shape[0],), float(mu_sat), dtype=ref_s_sub.dtype
+                )
+            else:
+                # radii for the repeated subhalo list
+                base = self.sub_pos - self.host_pos[self.sub_host_ids]
+                r_all = jnp.linalg.norm(base, axis=1)
+                rvir_all = self.host_rvir[self.sub_host_ids]
+                r_over_all = r_all / (rvir_all + 1e-12)
+                # repeat r_over according to k_soft to match ref_s_sub length
+                r_over_rep = jnp.repeat(r_over_all, k_soft, axis=0)
+                mu_soft = _satellite_mu_from_radius(
+                    r_over_rep, float(self.a_strength), float(self.gamma_strength)
+                )
+
             k6, self.key = random.split(self.key)
-            ori_sat = sample_watson_orientations(k6, ref_s_sub, mu_sat)
+            ori_sat = sample_watson_orientations(k6, ref_s_sub, mu_soft)
 
         # Concatenate centrals + satellites
         if cat_cent.size == 0 and cat_sat.size == 0:
@@ -699,7 +804,7 @@ if __name__ == "__main__":
         ]
     ]
 
-    idx = 4
+    idx = 1
     params = jnp.asarray(inputs[idx], dtype=jnp.float32)
     original_catalog = catalog[idx]
 
@@ -709,8 +814,9 @@ if __name__ == "__main__":
         do_discrete=True,
         do_nfw_fallback=True,
         seed=1234,
-        satellite_alignment="radial",
-        relaxed=False,
+        alignment_model="radial",
+        alignment_strength="constant",
+        relaxed=True,
         tau=0.1,
         Nmax_sat=256,
         t_rank=0.5,
@@ -722,3 +828,62 @@ if __name__ == "__main__":
 
     fig, axs = plot_diagnostic(builder, gal_cat=gal_cat, orig_catalog=original_catalog)
     plt.show()
+
+# def sample_centrals_diffhod(
+#     key: Array, mean_N_cen: Array, *, relaxed: bool = True, tau: float = 0.1
+# ) -> Tuple[Array, Array]:
+#     """
+#     Bernoulli or Relaxed Bernoulli (Gumbel-Logistic) + straight-through.
+#     Returns (hard_0_1, straight_through)
+#     """
+#     p = jnp.clip(mean_N_cen, 0.0, 1.0)
+#     ## make if statements static for jitting
+#     if not relaxed:
+#         u = random.uniform(key, p.shape)
+#         Hc = (u < p).astype(p.dtype)
+#         return Hc, Hc
+
+#     # relaxed
+#     key_u = key
+#     u = jnp.clip(random.uniform(key_u, p.shape), 1e-6, 1 - 1e-6)
+#     eps_logistic = jnp.log(u) - jnp.log1p(-u)
+#     z = sigmoid((_logit(p) + eps_logistic) / tau)
+#     z_hard = (z >= 0.5).astype(z.dtype)
+#     z_st = z_hard + (z - lax.stop_gradient(z))
+#     return z_hard, z_st
+
+
+# def sample_satellites_diffhod(
+#     key: Array,
+#     mean_N_sat: Array,
+#     *,
+#     N_max: int = 48,
+#     relaxed: bool = True,
+#     tau: float = 0.1,
+# ) -> Tuple[Array, Array]:
+#     """
+#     Binomial(N_max, p=lambda/N_max) via N_max independent (relaxed) Bernoullis.
+#     Returns (hard_counts:int, straight_through:float)
+#     """
+#     lam = jnp.clip(mean_N_sat, 0.0)
+#     p = jnp.clip(lam / float(N_max), 0.0, 1.0)
+
+#     if not relaxed:
+#         key_u = key
+#         u = random.uniform(key_u, (p.shape[0], N_max))
+#         trials = jnp.sum(u < p[:, None], axis=1)
+#         Kh = trials.astype(jnp.int32)
+#         return Kh, Kh.astype(jnp.float32)
+
+#     # relaxed independent trials
+#     key_u = key
+#     u = jnp.clip(random.uniform(key_u, (p.shape[0], N_max)), 1e-6, 1 - 1e-6)
+#     eps = jnp.log(u) - jnp.log1p(-u)
+#     logits = _logit(p)[:, None]
+#     z = sigmoid((logits + eps) / tau)  # [H, N_max]
+#     z_hard = (z >= 0.5).astype(z.dtype)
+#     z_st = z_hard + (z - lax.stop_gradient(z))
+#     Kh_soft = jnp.sum(z, axis=1)
+#     Kh_hard = jnp.sum(z_hard, axis=1).astype(jnp.int32)
+#     Kh_st = Kh_hard.astype(jnp.float32) + (Kh_soft - lax.stop_gradient(Kh_soft))
+#     return Kh_hard, Kh_st
