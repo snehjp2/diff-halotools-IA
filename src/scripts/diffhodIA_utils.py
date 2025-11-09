@@ -2,11 +2,18 @@ import h5py
 import numpy as np
 from halotools.mock_observables import ed_3d, ee_3d
 from tqdm import tqdm
-from typing import Optional, Tuple, Sequence
+from typing import Optional, Tuple, Sequence, Dict, Literal, Union
 import matplotlib.pyplot as plt
 
-# --------------------- Loading helpers --------------------
 
+
+__all__ = [
+    "mask_bad_halocat",
+    "load_cleaned_catalogs_from_h5",
+    "compute_ed_ee",
+    "compute_correlations",
+    "plot_diagnostic",
+]
 
 def mask_bad_halocat(halocat):
     bad_mask = (
@@ -47,7 +54,7 @@ def load_cleaned_catalogs_from_h5(path, as_list=True, debug=False):
 
         if as_list:
             catalogs = []
-            limit = 5 if debug else n_catalogs
+            limit = 50 if debug else n_catalogs
             for i in tqdm(range(limit), desc="loading catalogs"):
                 ds = g[f"{i:08d}"]
                 catalogs.append(ds[...])  # (nrows, ncols), dtype=float32
@@ -60,10 +67,6 @@ def load_cleaned_catalogs_from_h5(path, as_list=True, debug=False):
                 catalogs[int(k)] = g[k][...]
 
     return catalogs, columns
-
-
-# -------------------- plotting helpers --------------------
-
 
 def _as_xyz(a, name):
     """
@@ -82,8 +85,6 @@ def _as_xyz(a, name):
         a = a.T
     if a.ndim != 2 or a.shape[1] != 3:
         raise ValueError(f"{name} must have shape (N, 3); got {a.shape}")
-    if not np.isfinite(a).all():
-        raise ValueError(f"{name} contains non-finite values")
     return np.ascontiguousarray(a)
 
 
@@ -107,7 +108,6 @@ def _unit_vectors(v, name):
         out[~good] = rnd
     return out
 
-
 def compute_ed_ee(orig_pos, orig_ori, gen_pos, gen_ori, L, rbins=None, num_threads=1):
     """
     Compute the 3D ED and EE correlation functions for two catalogs.
@@ -125,7 +125,6 @@ def compute_ed_ee(orig_pos, orig_ori, gen_pos, gen_ori, L, rbins=None, num_threa
     - "ee_true": (N,) array of true EE values
     - "ee_gen": (N,) array of generated EE values
     """
-    # sanitize + periodic wrap
     orig_pos = _as_xyz(orig_pos, "orig_pos")
     orig_pos = np.mod(orig_pos, L)
     gen_pos = _as_xyz(gen_pos, "gen_pos")
@@ -133,16 +132,6 @@ def compute_ed_ee(orig_pos, orig_ori, gen_pos, gen_ori, L, rbins=None, num_threa
 
     orig_ori = _unit_vectors(orig_ori, "orig_ori")
     gen_ori = _unit_vectors(gen_ori, "gen_ori")
-
-    # length checks (Halotools will also check later, but this is clearer)
-    if len(orig_pos) != len(orig_ori):
-        raise ValueError(
-            f"orig_pos (N={len(orig_pos)}) and orig_ori (N={len(orig_ori)}) must match"
-        )
-    if len(gen_pos) != len(gen_ori):
-        raise ValueError(
-            f"gen_pos (N={len(gen_pos)}) and gen_ori (N={len(gen_ori)}) must match"
-        )
 
     if rbins is None:
         rbins = np.logspace(np.log10(0.1), np.log10(16), 20)
@@ -194,16 +183,14 @@ def compute_ed_ee(orig_pos, orig_ori, gen_pos, gen_ori, L, rbins=None, num_threa
         "ee_gen": ee_gen,
     }
 
-from typing import Optional, Tuple, Literal, Union, Dict
 
 def compute_correlations(
     builder=None,
     gal_cat: Optional["np.ndarray"] = None,
     *,
     L: Optional[float] = 250.0,
-    rbins_2pcf: Optional["np.ndarray"] = None,
-    rbins_ia: Optional["np.ndarray"] = None,
     num_threads: int = 4,
+    rbins: Optional["np.ndarray"] = None,
     which: Literal["all", "xi", "omega", "eta"] = "all",
 ) -> Union[
     Dict[str, "np.ndarray"],
@@ -233,26 +220,22 @@ def compute_correlations(
     -------
     If which == "all":
         dict with keys:
-          - "r_mid_2pcf": bin centers for xi
-          - "r_mid_ia":   bin centers for omega/eta
-          - "xi":   xi(r)
-          - "omega": ed_3d(r)
-          - "eta":  ee_3d(r)
+          - "r_bins": bins
+          - "xi":   galaxy clustering
+          - "omega": galaxy-orientation (ED3D)
+          - "eta":  orientation-orientation (EE3D)
     If which in {"xi", "omega", "eta"}:
         (r_mid, values) tuple for the requested stat.
     """
     import numpy as np
     from halotools.mock_observables import tpcf, ed_3d, ee_3d
 
-    # --- catalog handling ---
     if gal_cat is None:
-        if builder is None:
-            raise ValueError("Provide either `gal_cat` or `builder`.")
         gal_cat = builder.return_catalog()
 
     arr = np.asarray(gal_cat, dtype=float)
     if arr.ndim != 2 or arr.shape[1] < 6:
-        raise ValueError("`gal_cat` must have shape (N, >=6) with [:3]=pos and [3:6]=orientations.")
+        raise ValueError("`gal_cat` must have shape (N, 6) with [:3]=positions and [3:6]=orientations.")
     pos = arr[:, :3]
     ori = arr[:, 3:6]
 
@@ -264,17 +247,11 @@ def compute_correlations(
         period_kw = {}
         pos_stats = pos
 
-    # --- binning ---
-    if rbins_2pcf is None:
-        rbins_2pcf = np.logspace(np.log10(0.1), np.log10(8.0), 20)
-    rbins_2pcf = np.asarray(rbins_2pcf, dtype=float)
+    if rbins is None:
+        rbins = np.logspace(np.log10(0.1), np.log10(16.0), 20)
+    rbins = np.asarray(rbins, dtype=float)
 
-    if rbins_ia is None:
-        rbins_ia = rbins_2pcf
-    rbins_ia = np.asarray(rbins_ia, dtype=float)
-
-    r_mid_2pcf = 0.5 * (rbins_2pcf[1:] + rbins_2pcf[:-1])
-    r_mid_ia   = 0.5 * (rbins_ia[1:]   + rbins_ia[:-1])
+    r_mid = 0.5 * (rbins[1:] + rbins[:-1])
 
     # --- compute requested stats ---
     want_xi    = which in ("all", "xi")
@@ -284,32 +261,32 @@ def compute_correlations(
     xi = omega = eta = None
 
     if want_xi:
-        xi = tpcf(sample1=pos_stats, rbins=rbins_2pcf, num_threads=num_threads, **period_kw)
+        xi = tpcf(sample1=pos_stats, rbins=rbins, num_threads=num_threads, **period_kw)
 
     if want_omega:
         omega = ed_3d(
             sample1=pos_stats, sample2=pos_stats,
             orientations1=ori,
-            rbins=rbins_ia, num_threads=num_threads, **period_kw
+            rbins=rbins, num_threads=num_threads, **period_kw
         )
 
     if want_eta:
         eta = ee_3d(
             sample1=pos_stats, sample2=pos_stats,
             orientations1=ori, orientations2=ori,
-            rbins=rbins_ia, num_threads=num_threads, **period_kw
+            rbins=rbins, num_threads=num_threads, **period_kw
         )
 
     # --- return format ---
     if which == "xi":
-        return r_mid_2pcf, xi
+        return r_mid, xi
     if which == "omega":
-        return r_mid_ia, omega
+        return r_mid, omega
     if which == "eta":
-        return r_mid_ia, eta
+        return r_mid, eta
 
     return {
-        "r_bins": r_mid_2pcf,
+        "r_bins": r_mid, # for plotting
         "xi": xi,
         "omega": omega,
         "eta": eta,
@@ -324,8 +301,7 @@ def plot_diagnostic(
     *,
     L: Optional[float] = 250.0,
     nbins: int = 200,
-    rbins_2pcf: Optional["np.ndarray"] = None,
-    rbins_ia: Optional["np.ndarray"] = None,
+    rbins: Optional["np.ndarray"] = None,
     num_threads: int = 4,
     figsize: Optional[Tuple[int, int]] = None,
     axs: Optional[Sequence["plt.Axes"]] = None,
@@ -389,26 +365,23 @@ def plot_diagnostic(
         )
         Hg = Hg / (Hg.sum() + 1e-12)
 
-    if rbins_2pcf is None:
-        rbins_2pcf = np.logspace(np.log10(0.1), np.log10(8.0), 10)
-    if rbins_ia is None:
-        rbins_ia = rbins_2pcf
-    r_mid_2pcf = 0.5 * (rbins_2pcf[1:] + rbins_2pcf[:-1])
-    r_mid_ia = 0.5 * (rbins_ia[1:] + rbins_ia[:-1])
+    if rbins is None:
+        rbins = np.logspace(np.log10(0.1), np.log10(8.0), 10)
+    r_mid = 0.5 * (rbins[1:] + rbins[:-1])
 
     xi_gen = tpcf(
-        sample1=pos_gen_for_stats, rbins=rbins_2pcf, num_threads=num_threads, **period_kw
+        sample1=pos_gen_for_stats, rbins=rbins, num_threads=num_threads, **period_kw
     )
     if has_orig:
         xi_orig = tpcf(
-            sample1=pos_orig_for_stats, rbins=rbins_2pcf, num_threads=num_threads, **period_kw
+            sample1=pos_orig_for_stats, rbins=rbins, num_threads=num_threads, **period_kw
         )
 
     ed_gen = ed_3d(
         sample1=pos_gen_for_stats,
         sample2=pos_gen_for_stats,
         orientations1=gen_ori,
-        rbins=rbins_ia,
+        rbins=rbins,
         num_threads=num_threads,
         **period_kw,
     )
@@ -417,7 +390,7 @@ def plot_diagnostic(
         sample2=pos_gen_for_stats,
         orientations1=gen_ori,
         orientations2=gen_ori,
-        rbins=rbins_ia,
+        rbins=rbins,
         num_threads=num_threads,
         **period_kw,
     )
@@ -426,7 +399,7 @@ def plot_diagnostic(
             sample1=pos_orig_for_stats,
             sample2=pos_orig_for_stats,
             orientations1=orig_ori,
-            rbins=rbins_ia,
+            rbins=rbins,
             num_threads=num_threads,
             **period_kw,
         )
@@ -435,7 +408,7 @@ def plot_diagnostic(
             sample2=pos_orig_for_stats,
             orientations1=orig_ori,
             orientations2=orig_ori,
-            rbins=rbins_ia,
+            rbins=rbins,
             num_threads=num_threads,
             **period_kw,
         )
@@ -478,33 +451,33 @@ def plot_diagnostic(
 
     ax = axs[col]
     if has_orig:
-        ax.loglog(r_mid_2pcf, xi_orig, label="Original")
-        ax.loglog(r_mid_2pcf, xi_gen, "--", label="Generated")
+        ax.loglog(r_mid, xi_orig, label="Original")
+        ax.loglog(r_mid, xi_gen, "--", label="Generated")
         ax.legend()
     else:
-        ax.loglog(r_mid_2pcf, xi_gen)
+        ax.loglog(r_mid, xi_gen)
     ax.set_title(r"$\xi(r)$")
     ax.set_xlabel(r"$r$ [Mpc/h]")
     col += 1
 
     ax = axs[col]
     if has_orig:
-        ax.semilogx(r_mid_ia, ed_orig, label="Original")
-        ax.semilogx(r_mid_ia, ed_gen, "--", label="Generated")
+        ax.semilogx(r_mid, ed_orig, label="Original")
+        ax.semilogx(r_mid, ed_gen, "--", label="Generated")
         ax.legend()
     else:
-        ax.semilogx(r_mid_ia, ed_gen)
+        ax.semilogx(r_mid, ed_gen)
     ax.set_title(r"$\omega(r)$")
     ax.set_xlabel(r"$r$ [Mpc/h]")
     col += 1
 
     ax = axs[col]
     if has_orig:
-        ax.semilogx(r_mid_ia, ee_orig, label="Original")
-        ax.semilogx(r_mid_ia, ee_gen, "--", label="Generated")
+        ax.semilogx(r_mid, ee_orig, label="Original")
+        ax.semilogx(r_mid, ee_gen, "--", label="Generated")
         ax.legend()
     else:
-        ax.semilogx(r_mid_ia, ee_gen)
+        ax.semilogx(r_mid, ee_gen)
     ax.set_title(r"$\eta(r)$")
     ax.set_xlabel(r"$r$ [Mpc/h]$")
 

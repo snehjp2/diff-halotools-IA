@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from functools import partial
-from typing import Optional, Tuple
+from typing import Optional
 
 import jax
 import jax.numpy as jnp
@@ -16,12 +16,11 @@ from diffhodIA_utils import (
 from jax import config, jit, lax, random
 from jax.nn import sigmoid
 
-# config.update("jax_enable_x64", True)      # better numeric headroom
-# config.update("jax_debug_nans", True)  # crash when a NaN is created
-# config.update("jax_debug_infs", True)  # ditto for infs
-
-
 Array = jnp.ndarray
+
+# config.update("jax_enable_x64", True)
+# config.update("jax_debug_nans", True)
+# config.update("jax_debug_infs", True)
 
 
 def dbg(name, x):
@@ -52,12 +51,8 @@ def _erfi_real(x: Array) -> Array:
     Stable real-valued erfi for JAX arrays.
     Matches your piecewise series/asymptotic form, with bounded iteration counts.
     """
-    # x64 = x.astype(jnp.float64)
-    # ax = jnp.abs(x64)
-
     def small_branch(xs: Array) -> Array:
-        # Series: erfi(x) = 2/sqrt(pi) * sum_{n>=0} x^{2n+1} / (n! (2n+1))
-        # We implement via a stable recurrence on 'term' and accumulate into s
+        # erfi(x) = 2/sqrt(pi) * sum_{n>=0} x^{2n+1} / (n! (2n+1))
         def body_fun(n, carry):
             term, s = carry
             term = term * (xs * xs) / n  # multiply by x^2 / n
@@ -81,7 +76,7 @@ def _erfi_real(x: Array) -> Array:
     return y.astype(x.dtype)
 
 
-@jit
+@partial(jit, static_argnums=(3,))
 def _sample_t_watson(key: Array, kappa: Array, u: Array, n_newton: int = 6) -> Array:
     eps = 1e-12
 
@@ -121,18 +116,15 @@ def _sample_t_watson(key: Array, kappa: Array, u: Array, n_newton: int = 6) -> A
     return jnp.clip(t, -1.0 + 1e-6, 1.0 - 1e-6)
 
 
-@jit
+@partial(jit, static_argnums=(3,))  # n_newton is the 4th argument (index 3)
 def sample_watson_orientations(
     key: Array, ref_dirs: Array, mu: Array | float, n_newton: int = 6
 ) -> Array:
     """
     Dimroth–Watson axial samples about ref_dirs (unit vectors).
     """
-    # jax.debug.print("ref dirs = {}", ref_dirs)
-    # jax.debug.print("watson.mu.in = {}", mu)
 
     u_axis = _unitize(ref_dirs)
-    # jax.debug.print("watson.u_axis = {}", u_axis)
     N = u_axis.shape[0]
     mu_arr = jnp.asarray(mu, dtype=u_axis.dtype)
 
@@ -154,7 +146,6 @@ def sample_watson_orientations(
         random.uniform(key_u, (N,), minval=0.0, maxval=1.0), 1e-7, 1 - 1e-7
     )
     t = _sample_t_watson(key_u, kappa, u_uni, n_newton=n_newton)
-    # jax.debug.print("watson.t = {}", t)
 
     xhat = jnp.broadcast_to(
         jnp.array([1.0, 0.0, 0.0], dtype=u_axis.dtype), u_axis.shape
@@ -171,11 +162,9 @@ def sample_watson_orientations(
     costh = t.reshape(N, 1)
 
     n = _unitize(costh * u_axis + sinth * (jnp.cos(phi) * b1 + jnp.sin(phi) * b2))
-    # jax.debug.print("watson.n = {}", n)
     return n
 
 
-# -------------------- HOD means --------------------
 @jit
 def Ncen(M: Array, logMmin: float, sigma_logM: float) -> Array:
     log_M = jnp.log10(M)
@@ -230,7 +219,7 @@ def sample_centrals_diffhod(key, mean_N_cen, *, relaxed: bool = True, tau: float
     return lax.cond(pred, relaxed_branch, discrete_branch, operand=None)
 
 
-@partial(jit, static_argnames=("N_max",))
+@partial(jit, static_argnames=["N_max", "relaxed"])
 def sample_satellites_diffhod(
     key: jnp.ndarray,
     mean_N_sat: jnp.ndarray,
@@ -273,16 +262,16 @@ def sample_satellites_diffhod(
     return lax.cond(pred, relaxed_branch, discrete_branch, operand=None)
 
 
-@partial(jax.jit, static_argnames=("n_newton", "per_host_cap"))
+@partial(jax.jit, static_argnames=["n_newton", "per_host_cap"])
 def sample_nfw_about_hosts(
     key: Array,
-    host_centers: Array,         # [H, 3]
-    host_rvir: Array,            # [H]
-    counts_per_host: Array,      # [H], int-like
+    host_centers: Array,  # [H, 3]
+    host_rvir: Array,  # [H]
+    counts_per_host: Array,  # [H], int-like
     *,
     conc: float = 5.0,
     n_newton: int = 6,
-    per_host_cap: int = 64,      # STATIC: max draws per host
+    per_host_cap: int = 64,  # STATIC: max draws per host
 ):
     """
     Vectorized NFW radii via inverse CDF with fixed Newton iters.
@@ -302,47 +291,47 @@ def sample_nfw_about_hosts(
     counts = jnp.clip(counts_per_host.astype(jnp.int32), 0, per_host_cap)
 
     # Build static index grids
-    host_ids   = jnp.arange(H, dtype=jnp.int32)                      # [H]
-    host_idx   = jnp.repeat(host_ids, per_host_cap)                  # [H*K]
+    host_ids = jnp.arange(H, dtype=jnp.int32)  # [H]
+    host_idx = jnp.repeat(host_ids, per_host_cap)  # [H*K]
     # idx_in_host= jnp.tile(jnp.arange(per_host_cap, jnp.int32), (H,)) # [H*K]
     # Option A: minimal fix
     idx_in_host = jnp.tile(jnp.arange(per_host_cap, dtype=jnp.int32), (H,))  # [H*K]
 
-
     # Mask: keep only first counts[h] samples within each host
-    use_mask = idx_in_host < counts[host_idx]                        # [H*K], bool
+    use_mask = idx_in_host < counts[host_idx]  # [H*K], bool
 
     # Per-sample parameters
-    rvir = host_rvir[host_idx]                                       # [H*K]
-    rs   = rvir / conc                                               # [H*K]
+    rvir = host_rvir[host_idx]  # [H*K]
+    rs = rvir / conc  # [H*K]
 
     # RNG
     key_u, key_dir = random.split(key)
 
     # Draw uniforms/normals for the full static size (masked later)
-    u  = jnp.clip(random.uniform(key_u, (H * per_host_cap,), dtype=dtype), 1e-7, 1 - 1e-7)
+    u = jnp.clip(
+        random.uniform(key_u, (H * per_host_cap,), dtype=dtype), 1e-7, 1 - 1e-7
+    )
     mc = jnp.log1p(conc) - conc / (1 + conc)
-    y  = u * mc
+    y = u * mc
     x0 = conc * u
 
     # Newton iterations (vectorized, fixed count)
     def body_fun(_, x_curr):
-        fx  = jnp.log1p(x_curr) - x_curr / (1 + x_curr) - y
+        fx = jnp.log1p(x_curr) - x_curr / (1 + x_curr) - y
         dfx = x_curr / jnp.square(1 + x_curr)
         return jnp.clip(x_curr - fx / (dfx + 1e-30), 0.0)
 
     x_fin = lax.fori_loop(0, n_newton, body_fun, x0)
-    r     = x_fin * rs                                              # [H*K]
+    r = x_fin * rs  # [H*K]
 
     # Random directions
     z = random.normal(key_dir, (H * per_host_cap, 3), dtype=dtype)
-    z = z / (jnp.linalg.norm(z, axis=-1, keepdims=True) + 1e-12)    # _unitize
+    z = z / (jnp.linalg.norm(z, axis=-1, keepdims=True) + 1e-12)  # _unitize
 
-    pos_full = host_centers[host_idx] + r[:, None] * z              # [H*K, 3]
+    pos_full = host_centers[host_idx] + r[:, None] * z  # [H*K, 3]
 
     # Return fixed-shape arrays + mask (caller can slice with the mask or carry it forward)
     return pos_full, host_idx, use_mask
-
 
 
 # -------------------- per-host softmax over ranks --------------------
@@ -443,6 +432,7 @@ def per_host_softmax_over_ranks(
     return q  # sums to 1 per host
 
 
+@jit
 def _satellite_mu_from_radius(r_over_rvir: Array, a: float, gamma: float) -> Array:
     r_safe = jnp.nan_to_num(r_over_rvir, nan=0.0, posinf=1e3, neginf=0.0)
     r_clipped = jnp.clip(r_safe, 1e-5, 1e3)  # avoid negatives / zero
@@ -471,6 +461,7 @@ class DiffHalotoolsIA:
     tau: float = 0.1
     Nmax_sat: int = 256
     t_rank: float = 0.5
+    max_output_galaxies: int = 1000000
     seed: Optional[int] = None
 
     # cached tensors (device-resident)
@@ -494,9 +485,9 @@ class DiffHalotoolsIA:
         missing = [k for k in req if k not in self.subcat.colnames]
         if missing:
             raise KeyError(f"subcat missing required keys: {missing}")
-        
-        if self.alignment_strength.lower() == 'radial':
-            config.update("jax_enable_x64", True)      # better numeric headroom
+
+        if self.alignment_strength.lower() == "radial":
+            config.update("jax_enable_x64", True)  # better numeric headroom
 
         halo_id = np.asarray(self.subcat["halo_id"], dtype=np.int64)
         halo_upid = np.asarray(self.subcat["halo_upid"], dtype=np.int64)
@@ -605,8 +596,9 @@ class DiffHalotoolsIA:
         """
         Build and return (Ng, 6) array [x,y,z,nx,ny,nz]
         """
+        ## make above jax float conversions jax-friendly
         (mu_cen, mu_sat, logMmin, sigma_logM, logM0, logM1, alpha) = [
-            float(x) for x in jnp.asarray(self.params)
+            jnp.asarray(x, dtype=self.host_mvir.dtype) for x in jnp.asarray(self.params)
         ]
 
         mean_N_cen = Ncen(self.host_mvir, logMmin, sigma_logM)  # [H]
@@ -696,7 +688,7 @@ class DiffHalotoolsIA:
 
             if self.alignment_strength == "constant":
                 mu_sub = jnp.full(
-                    (ref_s_sub.shape[0],), float(mu_sat), dtype=ref_s_sub.dtype
+                    (ref_s_sub.shape[0],), mu_sat.astype(float), dtype=ref_s_sub.dtype
                 )
             else:
                 # radius for each chosen subhalo relative to its host
@@ -721,13 +713,18 @@ class DiffHalotoolsIA:
                 #     k4, self.host_pos, self.host_rvir, deficit, conc=5.0
                 # )
                 pos_full, host_idx_full, use_mask = sample_nfw_about_hosts(
-                    k4, self.host_pos, self.host_rvir, deficit,
-                conc=5.0, n_newton=6, per_host_cap=64
-            )
+                    k4,
+                    self.host_pos,
+                    self.host_rvir,
+                    deficit,
+                    conc=5.0,
+                    n_newton=6,
+                    per_host_cap=64,
+                )
 
                 # If you need ragged outputs *outside* jit:
-                nfw_pts     = pos_full[use_mask]
-                nfw_host_idx= host_idx_full[use_mask]
+                nfw_pts = pos_full[use_mask]
+                nfw_host_idx = host_idx_full[use_mask]
 
                 if nfw_pts.shape[0] > 0:
                     disp = nfw_pts - self.host_pos[nfw_host_idx]
@@ -736,7 +733,7 @@ class DiffHalotoolsIA:
                     # alignment strength for fallback points
                     if self.alignment_strength == "constant":
                         mu_nfw = jnp.full(
-                            (r_hat.shape[0],), float(mu_sat), dtype=r_hat.dtype
+                            (r_hat.shape[0],), mu_sat.astype(float), dtype=r_hat.dtype
                         )
                     else:
                         r = jnp.linalg.norm(disp, axis=1)
@@ -772,7 +769,7 @@ class DiffHalotoolsIA:
             # compute per-satellite mu for the repeated selection
             if self.alignment_strength == "constant":
                 mu_soft = jnp.full(
-                    (ref_s_sub.shape[0],), float(mu_sat), dtype=ref_s_sub.dtype
+                    (ref_s_sub.shape[0],), mu_sat.astype(float), dtype=ref_s_sub.dtype
                 )
             else:
                 # radii for the repeated subhalo list
@@ -795,6 +792,105 @@ class DiffHalotoolsIA:
         pos = jnp.concatenate([cat_cent, cat_sat], axis=0)
         ori = jnp.concatenate([ori_cent, ori_sat], axis=0)
         return jnp.concatenate([pos, ori], axis=1)
+
+    def return_catalog_fixed_shape(self) -> tuple[Array, Array]:
+        """
+        Build and return FIXED-SHAPE catalog suitable for JIT/HMC.
+        Returns:
+            catalog: [max_output_galaxies, 6] array [x,y,z,nx,ny,nz]
+            mask: [max_output_galaxies] bool array indicating valid galaxies
+        """
+        (mu_cen, mu_sat, logMmin, sigma_logM, logM0, logM1, alpha) = [
+            jnp.asarray(x, dtype=self.host_mvir.dtype) for x in jnp.asarray(self.params)
+        ]
+
+        mean_N_cen = Ncen(self.host_mvir, logMmin, sigma_logM)
+        mean_N_sat = Nsat(self.host_mvir, logMmin, sigma_logM, logM0, logM1, alpha)
+
+        # Centrals
+        k1, self.key = random.split(self.key)
+        Hc, Hc_st = sample_centrals_diffhod(
+            k1, mean_N_cen, relaxed=self.relaxed, tau=self.tau
+        )
+
+        n_hosts = self.host_pos.shape[0]
+
+        # All hosts are potential centrals (weighted by Hc_st)
+        k_oric, self.key = random.split(self.key)
+        cent_ori = sample_watson_orientations(k_oric, self.host_axis, mu_cen)
+
+        # Satellites
+        q = per_host_softmax_over_ranks(
+            self.sub_host_ids, self.sub_mvir, t_rank=self.t_rank
+        )
+        sat_w = q * mean_N_sat[self.sub_host_ids]
+
+        k2, self.key = random.split(self.key)
+        Kh, Kh_st = sample_satellites_diffhod(
+            k2, mean_N_sat, N_max=self.Nmax_sat, relaxed=self.relaxed, tau=self.tau
+        )
+
+        n_sub = self.sub_pos.shape[0]
+
+        # Satellite alignment
+        if self.alignment_model == "subhalo":
+            ref_s = self.sub_axis
+        else:
+            base = self.sub_pos - self.host_pos[self.sub_host_ids]
+            ref_s = _unitize(base)
+
+        if self.alignment_strength == "constant":
+            mu_sub = jnp.full((n_sub,), mu_sat.astype(float), dtype=ref_s.dtype)
+        else:
+            base_vec = self.sub_pos - self.host_pos[self.sub_host_ids]
+            r = jnp.linalg.norm(base_vec, axis=1)
+            rvir_sel = self.host_rvir[self.sub_host_ids]
+            r_over = r / (rvir_sel + 1e-12)
+            mu_sub = _satellite_mu_from_radius(
+                r_over, float(self.a_strength), float(self.gamma_strength)
+            )
+
+        k3, self.key = random.split(self.key)
+        sat_ori = sample_watson_orientations(k3, ref_s, mu_sub)
+
+        # Concatenate all sources (centrals + satellites)
+        all_pos = jnp.concatenate(
+            [self.host_pos, self.sub_pos], axis=0
+        )  # [n_hosts + n_sub, 3]
+        all_ori = jnp.concatenate([cent_ori, sat_ori], axis=0)  # [n_hosts + n_sub, 3]
+
+        # Weights for each source
+        cent_weights = Hc_st  # [n_hosts]
+        sat_weights = sat_w  # [n_sub]
+        all_weights = jnp.concatenate(
+            [cent_weights, sat_weights], axis=0
+        )  # [n_hosts + n_sub]
+
+        # Valid mask: sources with non-negligible weight
+        valid_mask_full = all_weights > 1e-6
+
+        # Pad or truncate to max_output_galaxies
+        max_gal = self.max_output_galaxies
+        total_sources = n_hosts + n_sub
+
+        if total_sources >= max_gal:
+            # Truncate to max_gal
+            catalog = jnp.concatenate([all_pos[:max_gal], all_ori[:max_gal]], axis=1)
+            valid_mask = valid_mask_full[:max_gal]
+        else:
+            # Pad to max_gal
+            pad_size = max_gal - total_sources
+            all_pos_padded = jnp.pad(all_pos, ((0, pad_size), (0, 0)), mode="constant")
+            all_ori_padded = jnp.pad(all_ori, ((0, pad_size), (0, 0)), mode="constant")
+            catalog = jnp.concatenate([all_pos_padded, all_ori_padded], axis=1)
+            valid_mask = jnp.pad(
+                valid_mask_full,
+                ((0, pad_size),),
+                mode="constant",
+                constant_values=False,
+            )
+
+        return catalog, valid_mask
 
 
 if __name__ == "__main__":
@@ -832,31 +928,34 @@ if __name__ == "__main__":
             "halo_hostid",
         ]
     ]
+    for idx in range(len(inputs)):
+        print(f"Running test for catalog index {idx}...")
+        # idx = 2
+        params = jnp.asarray(inputs[idx], dtype=jnp.float32)
+        original_catalog = catalog[idx]
 
-    idx = 0
-    params = jnp.asarray(inputs[idx], dtype=jnp.float32)
-    original_catalog = catalog[idx]
+        builder = DiffHalotoolsIA(
+            subcat=subcat,
+            params=params,
+            do_discrete=True,
+            do_nfw_fallback=True,
+            seed=1234,
+            alignment_model="radial",
+            alignment_strength="constant",
+            relaxed=True,
+            tau=0.1,
+            Nmax_sat=256,
+            t_rank=0.5,
+        )
 
-    builder = DiffHalotoolsIA(
-        subcat=subcat,
-        params=params,
-        do_discrete=True,
-        do_nfw_fallback=True,
-        seed=1234,
-        alignment_model="radial",
-        alignment_strength="constant",
-        relaxed=True,
-        tau=0.1,
-        Nmax_sat=256,
-        t_rank=0.5,
-    )
+        gal_cat = builder.return_catalog()
+        gal_cat = np.asarray(gal_cat)
+        print("Generated catalog shape:", gal_cat.shape)
 
-    gal_cat = builder.return_catalog()
-    gal_cat = np.asarray(gal_cat)
-    print("Generated catalog shape:", gal_cat.shape)
-
-    fig, axs = plot_diagnostic(builder, gal_cat=gal_cat, orig_catalog=original_catalog)
-    plt.show()
+        fig, axs = plot_diagnostic(
+            builder, gal_cat=gal_cat, orig_catalog=original_catalog
+        )
+        plt.show()
 
 # def sample_centrals_diffhod(
 #     key: Array, mean_N_cen: Array, *, relaxed: bool = True, tau: float = 0.1
@@ -940,7 +1039,7 @@ if __name__ == "__main__":
 
 #     counts = jnp.clip(counts_per_host, 0).astype(jnp.int32)
 #     total = jnp.sum(counts).astype(jnp.int32)
-    
+
 #     # if total == 0:
 #     #     return jnp.zeros((0, 3), host_centers.dtype), jnp.zeros((0,), jnp.int32)
 

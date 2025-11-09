@@ -17,7 +17,7 @@ from diffhodIA_utils import load_cleaned_catalogs_from_h5, mask_bad_halocat
 from halotools.sim_manager import CachedHaloCatalog
 
 # Your JAX builder
-from jax_diffhodIA import DiffHalotoolsIA
+from jax_diffhodIA_stable import DiffHalotoolsIA
 
 jax.config.update("jax_enable_x64", True)  # better numeric headroom
 
