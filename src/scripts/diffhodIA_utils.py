@@ -54,7 +54,7 @@ def load_cleaned_catalogs_from_h5(path, as_list=True, debug=False):
 
         if as_list:
             catalogs = []
-            limit = 50 if debug else n_catalogs
+            limit = 5 if debug else n_catalogs
             for i in tqdm(range(limit), desc="loading catalogs"):
                 ds = g[f"{i:08d}"]
                 catalogs.append(ds[...])  # (nrows, ncols), dtype=float32
@@ -366,7 +366,7 @@ def plot_diagnostic(
         Hg = Hg / (Hg.sum() + 1e-12)
 
     if rbins is None:
-        rbins = np.logspace(np.log10(0.1), np.log10(8.0), 10)
+        rbins = np.logspace(np.log10(0.1), np.log10(16.0), 20)
     r_mid = 0.5 * (rbins[1:] + rbins[:-1])
 
     xi_gen = tpcf(

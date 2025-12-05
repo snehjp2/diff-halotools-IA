@@ -64,6 +64,7 @@ def _erfi_real(x: Array) -> Array:
 @partial(jit, static_argnums=(3,))
 def _sample_t_watson(key: Array, kappa: Array, u: Array, n_newton: int = 6) -> Array:
     eps = 1e-12
+    # kappa = jnp.clip(kappa, -50.0, 50.0)  # Instead of -1e6, 1e6
 
     def one(k_i, u_i):
         def neg_branch(_):
@@ -99,7 +100,6 @@ def _sample_t_watson(key: Array, kappa: Array, u: Array, n_newton: int = 6) -> A
 
     t = jax.vmap(one)(kappa, u)
     return jnp.clip(t, -1.0 + 1e-6, 1.0 - 1e-6)
-
 
 @partial(jit, static_argnums=(3,))  # n_newton is the 4th argument (index 3)
 def sample_watson_orientations(
@@ -912,7 +912,7 @@ class DiffHalotoolsIA:
 
         if self.alignment_strength == "constant":
             mu_sub = jnp.full(
-                (ref_s_sub.shape[0],), float(mu_sat), dtype=ref_s_sub.dtype
+                (ref_s_sub.shape[0],), mu_sat.astype(float), dtype=ref_s_sub.dtype
             )
         else:
             base_vec = (self.sub_pos - self.host_pos[self.sub_host_ids])[chosen_sub_idx]
@@ -932,7 +932,7 @@ class DiffHalotoolsIA:
             disp = nfw_pts - self.host_pos[nfw_host_idx]
             r_hat = _unitize(disp)
             if self.alignment_strength == "constant":
-                mu_nfw = jnp.full((r_hat.shape[0],), float(mu_sat), dtype=r_hat.dtype)
+                mu_nfw = jnp.full((r_hat.shape[0],), mu_sat.astype(float), dtype=r_hat.dtype)
             else:
                 r = jnp.linalg.norm(disp, axis=1)
                 rvir_sel = self.host_rvir[nfw_host_idx]
@@ -968,10 +968,10 @@ class DiffHalotoolsIA:
         sub_ids_for_sub = (
             self.sub_halo_id[chosen_sub_idx]
             if chosen_sub_idx.shape[0] > 0
-            else jnp.zeros((0,), dtype=jnp.int64)
+            else jnp.zeros((0,), dtype=jnp.int32)
         )
-        sub_ids_pad_cent = -jnp.ones((host_idx_cent.shape[0],), dtype=jnp.int64)
-        sub_ids_pad_nfw = -jnp.ones((nfw_host_idx.shape[0],), dtype=jnp.int64)
+        sub_ids_pad_cent = -jnp.ones((host_idx_cent.shape[0],), dtype=jnp.int32)
+        sub_ids_pad_nfw = -jnp.ones((nfw_host_idx.shape[0],), dtype=jnp.int32)
         sub_halo_id_per_gal = jnp.concatenate(
             [sub_ids_pad_cent, sub_ids_for_sub, sub_ids_pad_nfw], axis=0
         )
@@ -1027,8 +1027,8 @@ if __name__ == "__main__":
     ]
     for idx in range(len(inputs)):
         print(f"Running test for catalog index {idx}...")
-        # idx = 2
-        params = jnp.asarray(inputs[idx], dtype=jnp.float32)
+        # params = jnp.asarray(inputs[idx], dtype=jnp.float32)
+        params = np.asarray([0.55, 0.03, 13.61, 0.26, 11.8, 12.6, 1.0])
         original_catalog = catalog[idx]
 
         builder = DiffHalotoolsIA(
@@ -1039,9 +1039,9 @@ if __name__ == "__main__":
             seed=1234,
             alignment_model="radial",
             alignment_strength="constant",
-            relaxed=True,
+            relaxed=False,
             tau=0.1,
-            Nmax_sat=512,
+            Nmax_sat=2048,
             t_rank=0.5,
         )
 
