@@ -257,10 +257,24 @@ def run_single_optimization(run_id, mu_c_init, mu_s_init, seed_pool, n_iters=N_I
     ], dtype=jnp.float32)
     
     optimizer = optax.adam(learning_rate=lr)
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(10.0),  # Clip gradients with norm > 1.0
+        optax.adam(learning_rate=lr)
+    )
     opt_state = optimizer.init(theta0)
     
     def step(theta, opt_state):
         loss, grads = jax.value_and_grad(loss_simple)(theta, seed_pool)
+        
+        # Check for NaN/Inf
+        if jnp.isnan(loss) or jnp.isinf(loss):
+            print(f"  [Run {run_id}] WARNING: NaN/Inf loss detected, stopping")
+            return theta, opt_state, loss, grads
+        
+        if jnp.any(jnp.isnan(grads)) or jnp.any(jnp.isinf(grads)):
+            print(f"  [Run {run_id}] WARNING: NaN/Inf gradients detected, stopping")
+            return theta, opt_state, loss, grads
+        
         updates, opt_state = optimizer.update(grads, opt_state, theta)
         theta_new = optax.apply_updates(theta, updates)
         return theta_new, opt_state, loss, grads
@@ -269,6 +283,11 @@ def run_single_optimization(run_id, mu_c_init, mu_s_init, seed_pool, n_iters=N_I
     theta_history = [np.asarray(theta0)]
     loss_history = [float(loss_simple(theta0, seed_pool))]
     grad_norm_history = []
+    
+    # Track best loss
+    best_loss = loss_history[0]
+    best_theta = theta0
+    best_iter = 0
     
     theta = theta0
     start_time = time.time()
@@ -279,6 +298,12 @@ def run_single_optimization(run_id, mu_c_init, mu_s_init, seed_pool, n_iters=N_I
         theta_history.append(np.asarray(theta))
         loss_history.append(float(loss_val))
         grad_norm_history.append(float(jnp.linalg.norm(grads)))
+        
+        # Update best if current loss is lower
+        if float(loss_val) < best_loss:
+            best_loss = float(loss_val)
+            best_theta = theta
+            best_iter = it + 1
         
         if verbose and it % 10 == 0:
             elapsed = time.time() - start_time
@@ -295,6 +320,10 @@ def run_single_optimization(run_id, mu_c_init, mu_s_init, seed_pool, n_iters=N_I
     mu_c_final = float(mu_from_theta(theta[0]))
     mu_s_final = float(mu_from_theta(theta[1]))
     
+    # Best values
+    mu_c_best = float(mu_from_theta(best_theta[0]))
+    mu_s_best = float(mu_from_theta(best_theta[1]))
+    
     return {
         'run_id': run_id,
         'n_seeds': len(seed_pool),
@@ -303,8 +332,12 @@ def run_single_optimization(run_id, mu_c_init, mu_s_init, seed_pool, n_iters=N_I
         'mu_s_init': mu_s_init,
         'mu_c_final': mu_c_final,
         'mu_s_final': mu_s_final,
+        'mu_c_best': mu_c_best,      # NEW: best mu_c
+        'mu_s_best': mu_s_best,      # NEW: best mu_s
         'loss_init': loss_history[0],
         'loss_final': loss_history[-1],
+        'loss_best': best_loss,       # NEW: best loss
+        'best_iter': best_iter,       # NEW: iteration where best occurred
         'theta_history': np.array(theta_history),
         'loss_history': np.array(loss_history),
         'grad_norm_history': np.array(grad_norm_history),
