@@ -34,11 +34,11 @@ MAX_MU = 0.95
 # Fixed random seed for reproducible initializations
 MASTER_INIT_SEED = 42
 
-# Seed configurations to test
+## reorder seed strategies for 5 2 1
 SEED_STRATEGIES = {
-    '1_seed': [3],
-    '2_seeds': [3, 34],
     '5_seeds': [3, 34, 345, 3456, 34567],
+    '2_seeds': [3, 34],
+    '1_seed': [3],
 }
 
 # Loss weights
@@ -256,10 +256,15 @@ def run_single_optimization(run_id, mu_c_init, mu_s_init, seed_pool, n_iters=N_I
         theta_from_mu(mu_s_init)
     ], dtype=jnp.float32)
     
-    optimizer = optax.adam(learning_rate=lr)
+    schedule = optax.exponential_decay(
+        init_value=lr,
+        transition_steps=20,
+        decay_rate=0.95
+    )
+    
     optimizer = optax.chain(
         optax.clip_by_global_norm(10.0),  # Clip gradients with norm > 1.0
-        optax.adam(learning_rate=lr)
+        optax.adam(learning_rate=schedule)
     )
     opt_state = optimizer.init(theta0)
     
