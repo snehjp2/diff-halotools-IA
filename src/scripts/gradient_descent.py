@@ -26,7 +26,7 @@ print(f"JAX devices: {jax.devices()}")
 TARGET_PARAMS = np.asarray([0.78, 0.33, 12.02, 0.26, 11.38, 13.31, 1.06])
 BASE_PARAMS = jnp.array([0.0, 0.0, 12.02, 0.26, 11.38, 13.31, 1.0], dtype=jnp.float32)
 
-N_PARALLEL_RUNS = 10  # Number of parallel optimizations
+N_PARALLEL_RUNS = 50  # Number of parallel optimizations
 N_ITERS = 100
 LEARNING_RATE = 5e-2
 MAX_MU = 0.95
@@ -36,10 +36,10 @@ MASTER_INIT_SEED = 42
 
 ## reorder seed strategies for 5 2 1
 SEED_STRATEGIES = {
-    '5_seeds': [3, 34, 345, 3456, 34567],
-    '2_seeds': [3, 34],
     '1_seed': [3],
+    '3_seeds': [3, 34, 345],
 }
+
 
 # Loss weights
 W_C_MEAN = 1.0
