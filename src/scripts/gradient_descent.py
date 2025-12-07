@@ -320,6 +320,9 @@ def run_single_optimization(run_id, mu_c_init, mu_s_init, seed_pool, n_iters=N_I
             )
     
     elapsed_time = time.time() - start_time
+    theta_history_array = np.array(theta_history)  # [n_iters+1, 2]
+    mu_c_history = np.array([float(mu_from_theta(theta[0])) for theta in theta_history])
+    mu_s_history = np.array([float(mu_from_theta(theta[1])) for theta in theta_history])
     
     # Final values
     mu_c_final = float(mu_from_theta(theta[0]))
@@ -341,9 +344,11 @@ def run_single_optimization(run_id, mu_c_init, mu_s_init, seed_pool, n_iters=N_I
         'mu_s_best': mu_s_best,      # NEW: best mu_s
         'loss_init': loss_history[0],
         'loss_final': loss_history[-1],
+        'theta_history': theta_history_array,      # [n_iters+1, 2] theta values
+        'mu_c_history': mu_c_history,              # NEW: [n_iters+1] mu_c trajectory
+        'mu_s_history': mu_s_history, 
         'loss_best': best_loss,       # NEW: best loss
         'best_iter': best_iter,       # NEW: iteration where best occurred
-        'theta_history': np.array(theta_history),
         'loss_history': np.array(loss_history),
         'grad_norm_history': np.array(grad_norm_history),
         'elapsed_time': elapsed_time,
