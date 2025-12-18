@@ -62,8 +62,8 @@ print(f"\nGenerating {N_PARALLEL_RUNS} random initializations...")
 np.random.seed(MASTER_INIT_SEED)
 FIXED_INITIALIZATIONS = []
 for i in range(N_PARALLEL_RUNS):
-    mu_c_init = np.random.uniform(-0.3, 0.3)
-    mu_s_init = np.random.uniform(-0.3, 0.3)
+    mu_c_init = np.random.uniform(-1.0, 1.0)
+    mu_s_init = np.random.uniform(-1.0, 1.0)
     FIXED_INITIALIZATIONS.append((mu_c_init, mu_s_init))
     if i < 10 or i >= N_PARALLEL_RUNS - 3:
         print(f"  Init {i+1}: mu_c={mu_c_init:+.3f}, mu_s={mu_s_init:+.3f}")
