@@ -38,11 +38,11 @@ HOD_PARAMS_FIXED = TARGET_PARAMS[2:]
 
 N_PARALLEL_RUNS = 50
 N_ITERS = 1000
-LEARNING_RATE = 0.005  # Initial learning rate for schedule
+LEARNING_RATE = 0.01  # Initial learning rate for schedule
 MAX_MU = 0.95
 
 # Learning rate schedule settings
-LR_DECAY_RATE = 0.85
+LR_DECAY_RATE = 0.65
 LR_TRANSITION_STEPS = 100
 
 # Variance reduction settings
