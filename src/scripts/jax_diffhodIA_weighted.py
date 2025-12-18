@@ -846,7 +846,7 @@ class DiffHalotoolsIA:
         
         if self.alignment_strength == "constant":
             mu_sub = jnp.full((self.sub_pos.shape[0],), 
-                            float(mu_sat), dtype=ref_s.dtype)
+                            mu_sat.astype(ref_s.dtype), dtype=ref_s.dtype)
         else:
             base_vec = self.sub_pos - self.host_pos[self.sub_host_ids]
             r = jnp.linalg.norm(base_vec, axis=1)
@@ -1268,7 +1268,7 @@ class DiffHalotoolsIA:
 
         if self.alignment_strength == "constant":
             mu_sub = jnp.full(
-                (ref_s_sub.shape[0],), float(mu_sat), dtype=ref_s_sub.dtype
+                (ref_s_sub.shape[0],), mu_sat.astype(ref_s_sub.dtype), dtype=ref_s_sub.dtype
             )
         else:
             base_vec = (self.sub_pos - self.host_pos[self.sub_host_ids])[chosen_sub_idx]
@@ -1288,7 +1288,7 @@ class DiffHalotoolsIA:
             disp = nfw_pts - self.host_pos[nfw_host_idx]
             r_hat = _unitize(disp)
             if self.alignment_strength == "constant":
-                mu_nfw = jnp.full((r_hat.shape[0],), float(mu_sat), dtype=r_hat.dtype)
+                mu_nfw = jnp.full((r_hat.shape[0],), mu_sat.astype(r_hat.dtype), dtype=r_hat.dtype)
             else:
                 r = jnp.linalg.norm(disp, axis=1)
                 rvir_sel = self.host_rvir[nfw_host_idx]
@@ -1344,21 +1344,189 @@ class DiffHalotoolsIA:
         )
         return catalog, meta
     
+    # def return_catalog_with_weights(self):
+    #     """
+    #     Returns soft catalog with weights for differentiable correlation functions.
+    #     Must use relaxed=True to get meaningful weights.
+        
+    #     Returns:
+    #         catalog: [N_sources, 6] array [x,y,z,nx,ny,nz] for all hosts+subs
+    #         weights: [N_sources] HOD occupation weights
+    #     """
+    #     if self.do_discrete:
+    #         raise ValueError(
+    #             "return_catalog_with_weights requires relaxed=True and do_discrete=False. "
+    #             "With do_discrete=True, you filter galaxies and lose the weight information."
+    #         )
+        
+    #     (mu_cen, mu_sat, logMmin, sigma_logM, logM0, logM1, alpha) = [
+    #         jnp.asarray(x, dtype=self.host_mvir.dtype) for x in jnp.asarray(self.params)
+    #     ]
+
+    #     mean_N_cen = Ncen(self.host_mvir, logMmin, sigma_logM)
+    #     mean_N_sat = Nsat(self.host_mvir, logMmin, sigma_logM, logM0, logM1, alpha)
+
+    #     # Generate orientations for ALL hosts
+    #     k_oric, self.key = random.split(self.key)
+    #     cent_ori = sample_watson_orientations(k_oric, self.host_axis, mu_cen)
+
+    #     # Satellite weights via softmax
+    #     q = per_host_softmax_over_ranks(
+    #         self.sub_host_ids, self.sub_mvir, t_rank=self.t_rank
+    #     )
+    #     sat_w = q * mean_N_sat[self.sub_host_ids]
+
+    #     # Generate orientations for ALL subhalos
+    #     if self.alignment_model == "subhalo":
+    #         ref_s = self.sub_axis
+    #     else:
+    #         base = self.sub_pos - self.host_pos[self.sub_host_ids]
+    #         ref_s = _unitize(base)
+
+    #     if self.alignment_strength == "constant":
+    #         mu_sub = jnp.full((self.sub_pos.shape[0],), mu_sat.astype(ref_s.dtype), dtype=ref_s.dtype)
+    #     else:
+    #         base_vec = self.sub_pos - self.host_pos[self.sub_host_ids]
+    #         r = jnp.linalg.norm(base_vec, axis=1)
+    #         rvir_sel = self.host_rvir[self.sub_host_ids]
+    #         r_over = r / (rvir_sel + 1e-12)
+    #         mu_sub = _satellite_mu_from_radius(
+    #             r_over, float(self.a_strength), float(self.gamma_strength)
+    #         )
+
+    #     k_oris, self.key = random.split(self.key)
+    #     sat_ori = sample_watson_orientations(k_oris, ref_s, mu_sub)
+
+    #     # Concatenate ALL sources (hosts + subs)
+    #     all_pos = jnp.concatenate([self.host_pos, self.sub_pos], axis=0)
+    #     all_ori = jnp.concatenate([cent_ori, sat_ori], axis=0)
+    #     all_weights = jnp.concatenate([mean_N_cen, sat_w], axis=0)
+
+    #     catalog = jnp.concatenate([all_pos, all_ori], axis=1)
+        
+    #     return catalog, all_weights
+    
+    # def return_catalog_with_weights(self):
+    #     """
+    #     Returns soft catalog with weights that matches the discrete sampling.
+        
+    #     For centrals: Use the straight-through estimator from sample_centrals_diffhod
+    #     For satellites: Use the softmax weights but only for the TOP-ranked subhalos
+        
+    #     Returns:
+    #         catalog: [N_sources, 6] array [x,y,z,nx,ny,nz]
+    #         weights: [N_sources] HOD occupation weights
+    #     """
+    #     if self.do_discrete:
+    #         raise ValueError(
+    #             "return_catalog_with_weights requires do_discrete=False. "
+    #             "With do_discrete=True, use the discrete catalog."
+    #         )
+        
+    #     (mu_cen, mu_sat, logMmin, sigma_logM, logM0, logM1, alpha) = [
+    #         jnp.asarray(x, dtype=self.host_mvir.dtype) for x in jnp.asarray(self.params)
+    #     ]
+
+    #     mean_N_cen = Ncen(self.host_mvir, logMmin, sigma_logM)
+    #     mean_N_sat = Nsat(self.host_mvir, logMmin, sigma_logM, logM0, logM1, alpha)
+
+    #     # ===== CENTRALS: Use straight-through estimator =====
+    #     k1, self.key = random.split(self.key)
+    #     Hc_hard, Hc_st = sample_centrals_diffhod(
+    #         k1, mean_N_cen, relaxed=self.relaxed, tau=self.tau
+    #     )
+        
+    #     # Filter to only hosts that have Hc_st > threshold
+    #     # This matches the structure of discrete sampling
+    #     cent_threshold = 0.5 if self.relaxed else 0.99
+    #     sel_c = Hc_st > cent_threshold
+        
+    #     cat_cent = self.host_pos[sel_c]
+    #     cent_weights = Hc_st[sel_c]  # Use straight-through values
+        
+    #     # Generate orientations only for selected centrals
+    #     k_oric, self.key = random.split(self.key)
+    #     ori_cent = sample_watson_orientations(k_oric, self.host_axis[sel_c], mu_cen)
+
+    #     # ===== SATELLITES: Match discrete sampling structure =====
+    #     # Use the same ranking logic as return_catalog()
+    #     q = per_host_softmax_over_ranks(
+    #         self.sub_host_ids, self.sub_mvir, t_rank=self.t_rank
+    #     )
+        
+    #     # Sample how many satellites each host gets (for structure)
+    #     k2, self.key = random.split(self.key)
+    #     Kh_hard, Kh_st = sample_satellites_diffhod(
+    #         k2, mean_N_sat, N_max=self.Nmax_sat, relaxed=self.relaxed, tau=self.tau
+    #     )
+        
+    #     # Sort subhalos by (host_id, -mass) to get ranks
+    #     n_sub = self.sub_pos.shape[0]
+    #     order = jnp.lexsort((-q, self.sub_host_ids))
+    #     h_sorted = self.sub_host_ids[order]
+        
+    #     # Find rank of each subhalo within its host
+    #     is_start = jnp.concatenate([jnp.array([True]), (h_sorted[1:] != h_sorted[:-1])])
+    #     idx = jnp.arange(n_sub, dtype=jnp.int32)
+    #     start_idx_mark = jnp.where(is_start, idx, -1)
+        
+    #     def scan_max(carry, x):
+    #         new = jnp.maximum(carry, x)
+    #         return new, new
+        
+    #     _, last_start_idx = lax.scan(scan_max, jnp.int32(-1), start_idx_mark)
+    #     ranks_in_host = idx - last_start_idx
+        
+    #     # Keep only subhalos with rank < Kh (matching discrete sampling)
+    #     # Use Kh_st for soft version
+    #     keep_sorted = ranks_in_host < Kh_st[h_sorted]  # Soft comparison
+        
+    #     # Map back to original order
+    #     keep_original = jnp.zeros(n_sub, dtype=bool)
+    #     keep_original = keep_original.at[order].set(keep_sorted)
+        
+    #     # Filter subhalos and compute their weights
+    #     cat_sat = self.sub_pos[keep_original]
+    #     sat_weights = q[keep_original] * mean_N_sat[self.sub_host_ids[keep_original]]
+        
+    #     # Generate orientations for selected satellites
+    #     if self.alignment_model == "subhalo":
+    #         ref_s = self.sub_axis[keep_original]
+    #     else:
+    #         base = self.sub_pos - self.host_pos[self.sub_host_ids]
+    #         ref_s = _unitize(base)[keep_original]
+        
+    #     if self.alignment_strength == "constant":
+    #         mu_sub = jnp.full((ref_s.shape[0],), mu_sat.astype(ref_s.dtype), dtype=ref_s.dtype)
+    #     else:
+    #         base_vec = self.sub_pos - self.host_pos[self.sub_host_ids]
+    #         r = jnp.linalg.norm(base_vec, axis=1)
+    #         rvir_sel = self.host_rvir[self.sub_host_ids]
+    #         r_over = r / (rvir_sel + 1e-12)
+    #         mu_all = _satellite_mu_from_radius(
+    #             r_over, float(self.a_strength), float(self.gamma_strength)
+    #         )
+    #         mu_sub = mu_all[keep_original]
+        
+    #     k_oris, self.key = random.split(self.key)
+    #     ori_sat = sample_watson_orientations(k_oris, ref_s, mu_sub)
+
+    #     # Concatenate centrals and satellites
+    #     all_pos = jnp.concatenate([cat_cent, cat_sat], axis=0)
+    #     all_ori = jnp.concatenate([ori_cent, ori_sat], axis=0)
+    #     all_weights = jnp.concatenate([cent_weights, sat_weights], axis=0)
+
+    #     catalog = jnp.concatenate([all_pos, all_ori], axis=1)
+        
+    #     return catalog, all_weights
+    
     def return_catalog_with_weights(self):
         """
-        Returns soft catalog with weights for differentiable correlation functions.
-        Must use relaxed=True to get meaningful weights.
+        Returns catalog with IDENTICAL structure to return_catalog() but with soft weights.
         
-        Returns:
-            catalog: [N_sources, 6] array [x,y,z,nx,ny,nz] for all hosts+subs
-            weights: [N_sources] HOD occupation weights
+        Key insight: We must use relaxed=False internally to get the same discrete
+        selection, then compute soft weights for those selected galaxies.
         """
-        if self.do_discrete:
-            raise ValueError(
-                "return_catalog_with_weights requires relaxed=True and do_discrete=False. "
-                "With do_discrete=True, you filter galaxies and lose the weight information."
-            )
-        
         (mu_cen, mu_sat, logMmin, sigma_logM, logM0, logM1, alpha) = [
             jnp.asarray(x, dtype=self.host_mvir.dtype) for x in jnp.asarray(self.params)
         ]
@@ -1366,41 +1534,146 @@ class DiffHalotoolsIA:
         mean_N_cen = Ncen(self.host_mvir, logMmin, sigma_logM)
         mean_N_sat = Nsat(self.host_mvir, logMmin, sigma_logM, logM0, logM1, alpha)
 
-        # Generate orientations for ALL hosts
+        # ===== CENTRALS: Use DISCRETE sampling for selection =====
+        k1, self.key = random.split(self.key)
+        # Sample with relaxed=False to get exact same selection as return_catalog()
+        Hc_hard, _ = sample_centrals_diffhod(
+            k1, mean_N_cen, relaxed=False, tau=self.tau
+        )
+        
+        sel_c = Hc_hard.astype(bool)
+        cat_cent = self.host_pos[sel_c]
+        
+        # Soft weights: use the mean occupation probability for selected centrals
+        cent_weights = mean_N_cen[sel_c]
+        
         k_oric, self.key = random.split(self.key)
-        cent_ori = sample_watson_orientations(k_oric, self.host_axis, mu_cen)
+        ori_cent = sample_watson_orientations(k_oric, self.host_axis[sel_c], mu_cen)
 
-        # Satellite weights via softmax
+        # ===== SATELLITES: Use DISCRETE sampling for selection =====
         q = per_host_softmax_over_ranks(
             self.sub_host_ids, self.sub_mvir, t_rank=self.t_rank
         )
-        sat_w = q * mean_N_sat[self.sub_host_ids]
-
-        # Generate orientations for ALL subhalos
+        
+        k2, self.key = random.split(self.key)
+        # Sample with relaxed=False for exact same selection
+        Kh_hard, _ = sample_satellites_diffhod(
+            k2, mean_N_sat, N_max=self.Nmax_sat, relaxed=False, tau=self.tau
+        )
+        
+        n_host = self.host_pos.shape[0]
+        n_sub = self.sub_pos.shape[0]
+        
+        # Exact same ranking logic as return_catalog()
+        order = jnp.lexsort((-q, self.sub_host_ids))
+        h_sorted = self.sub_host_ids[order]
+        
+        is_start = jnp.concatenate([jnp.array([True]), (h_sorted[1:] != h_sorted[:-1])])
+        idx = jnp.arange(n_sub, dtype=jnp.int32)
+        start_idx_mark = jnp.where(is_start, idx, -1)
+        
+        def scan_max(carry, x):
+            new = jnp.maximum(carry, x)
+            return new, new
+        
+        _, last_start_idx = lax.scan(scan_max, jnp.int32(-1), start_idx_mark)
+        ranks_in_host = idx - last_start_idx
+        
+        # Use HARD Kh for selection (identical to discrete)
+        keep_sorted = ranks_in_host < Kh_hard[h_sorted]
+        chosen_sorted_idx = order[keep_sorted]
+        
+        sat_counts = jnp.zeros((n_sub,), dtype=jnp.int32).at[chosen_sorted_idx].add(1)
+        
+        # Positions from subhalos
+        cat_sat_sub = jnp.repeat(self.sub_pos, sat_counts, axis=0)
+        chosen_sub_idx = jnp.nonzero(sat_counts, size=sat_counts.size, fill_value=-1)[0]
+        chosen_sub_idx = chosen_sub_idx[chosen_sub_idx >= 0]
+        
+        # Soft weights for satellites: q * Nsat(host)
+        sat_weights_sub = q[chosen_sub_idx] * mean_N_sat[self.sub_host_ids[chosen_sub_idx]]
+        
+        # Orientations for subhalo satellites
         if self.alignment_model == "subhalo":
-            ref_s = self.sub_axis
+            ref_s_sub = self.sub_axis[chosen_sub_idx]
         else:
             base = self.sub_pos - self.host_pos[self.sub_host_ids]
-            ref_s = _unitize(base)
-
+            ref_s_sub = _unitize(base)[chosen_sub_idx]
+        
         if self.alignment_strength == "constant":
-            mu_sub = jnp.full((self.sub_pos.shape[0],), mu_sat.astype(ref_s.dtype), dtype=ref_s.dtype)
+            mu_sub = jnp.full(
+                (ref_s_sub.shape[0],), mu_sat.astype(ref_s_sub.dtype), dtype=ref_s_sub.dtype
+            )
         else:
-            base_vec = self.sub_pos - self.host_pos[self.sub_host_ids]
+            base_vec = (self.sub_pos - self.host_pos[self.sub_host_ids])[chosen_sub_idx]
             r = jnp.linalg.norm(base_vec, axis=1)
-            rvir_sel = self.host_rvir[self.sub_host_ids]
+            rvir_sel = self.host_rvir[self.sub_host_ids[chosen_sub_idx]]
             r_over = r / (rvir_sel + 1e-12)
             mu_sub = _satellite_mu_from_radius(
                 r_over, float(self.a_strength), float(self.gamma_strength)
             )
+        
+        k3, self.key = random.split(self.key)
+        mu_sub = jnp.nan_to_num(mu_sub, nan=0.0)
+        mu_sub = jnp.clip(mu_sub, -0.999, 0.999)
+        ori_sat_sub = sample_watson_orientations(k3, ref_s_sub, mu_sub)
+        
+        # ===== NFW FALLBACK (if enabled) =====
+        if self.do_nfw_fallback:
+            placed_per_host = (
+                jnp.zeros((n_host,), dtype=jnp.int32)
+                .at[self.sub_host_ids]
+                .add(sat_counts)
+            )
+            deficit = jnp.clip(Kh_hard - placed_per_host, 0)
+            
+            k4, self.key = random.split(self.key)
+            pos_full, host_idx_full, use_mask = sample_nfw_about_hosts(
+                k4, self.host_pos, self.host_rvir, deficit,
+                conc=5.0, n_newton=6, per_host_cap=64,
+            )
+            nfw_pts = pos_full[use_mask]
+            nfw_host_idx = host_idx_full[use_mask]
+            
+            if nfw_pts.shape[0] > 0:
+                disp = nfw_pts - self.host_pos[nfw_host_idx]
+                r_hat = _unitize(disp)
+                
+                if self.alignment_strength == "constant":
+                    mu_nfw = jnp.full(
+                        (r_hat.shape[0],), mu_sat.astype(r_hat.dtype), dtype=r_hat.dtype
+                    )
+                else:
+                    r = jnp.linalg.norm(disp, axis=1)
+                    rvir_sel = self.host_rvir[nfw_host_idx]
+                    r_over = r / (rvir_sel + 1e-12)
+                    mu_nfw = _satellite_mu_from_radius(
+                        r_over, float(self.a_strength), float(self.gamma_strength)
+                    )
+                
+                k5, self.key = random.split(self.key)
+                ori_sat_nfw = sample_watson_orientations(k5, r_hat, mu_nfw)
+                
+                # NFW satellites: weight = expected satellites for that host / deficit
+                # Simplified: just use weight = 1 (they're drawn to fill the deficit)
+                nfw_weights = jnp.ones(nfw_pts.shape[0], dtype=cat_sat_sub.dtype)
+                
+                cat_sat = jnp.concatenate([cat_sat_sub, nfw_pts], axis=0)
+                ori_sat = jnp.concatenate([ori_sat_sub, ori_sat_nfw], axis=0)
+                sat_weights = jnp.concatenate([sat_weights_sub, nfw_weights], axis=0)
+            else:
+                cat_sat = cat_sat_sub
+                ori_sat = ori_sat_sub
+                sat_weights = sat_weights_sub
+        else:
+            cat_sat = cat_sat_sub
+            ori_sat = ori_sat_sub
+            sat_weights = sat_weights_sub
 
-        k_oris, self.key = random.split(self.key)
-        sat_ori = sample_watson_orientations(k_oris, ref_s, mu_sub)
-
-        # Concatenate ALL sources (hosts + subs)
-        all_pos = jnp.concatenate([self.host_pos, self.sub_pos], axis=0)
-        all_ori = jnp.concatenate([cent_ori, sat_ori], axis=0)
-        all_weights = jnp.concatenate([mean_N_cen, sat_w], axis=0)
+        # Concatenate all
+        all_pos = jnp.concatenate([cat_cent, cat_sat], axis=0)
+        all_ori = jnp.concatenate([ori_cent, ori_sat], axis=0)
+        all_weights = jnp.concatenate([cent_weights, sat_weights], axis=0)
 
         catalog = jnp.concatenate([all_pos, all_ori], axis=1)
         
