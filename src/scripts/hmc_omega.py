@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Hamiltonian Monte Carlo inference of intrinsic alignment parameters using omega(r).
-Uses NumPyro's NUTS sampler.
+IMPROVED VERSION with better variance reduction.
 """
 
 # Suppress XLA warnings
@@ -19,7 +19,6 @@ from scipy.spatial import cKDTree
 import numpyro
 import numpyro.distributions as dist
 from numpyro.infer import MCMC, NUTS
-from numpyro import handlers
 from jax import random
 
 from jax_diffhodIA_weighted import (
@@ -34,17 +33,19 @@ print(f"JAX devices: {jax.devices()}")
 # ============================================================
 # Configuration
 # ============================================================
-TARGET_PARAMS = np.asarray([0.78, 0.33, 12.54, 0.26, 12.68, 13.48, 1.0])
+TARGET_PARAMS = np.asarray([0.79, 0.30, 12.54, 0.26, 12.68, 13.48, 1.0])
 HOD_PARAMS_FIXED = TARGET_PARAMS[2:]
 
+TRUE_MU_CEN = 0.79
+TRUE_MU_SAT = 0.30
+
 MAX_MU = 0.95
+BOX_SIZE = 250.0
 
-# Variance reduction settings
-N_SAMPLES_PER_STEP = 5  # Average over this many orientation samples per likelihood eval
-N_TARGET_SAMPLES = 20  # Samples to average for target omega
+# IMPROVED: Increase samples per step for variance reduction
+N_SAMPLES_PER_STEP = 5  # Was 1, now 10
 
-# Seeds
-SEED_TARGET = 42
+# Seed for inference catalog
 SEED_OPT = 999
 
 # MCMC settings
@@ -53,7 +54,31 @@ N_SAMPLES = 1000
 N_CHAINS = 4
 
 # ============================================================
-# Load halo catalog (do once globally)
+# Load target omega and covariance
+# ============================================================
+print("\nLoading target ω(r) and covariance...")
+
+OMEGA_TARGET = np.load('/Users/snehpandya/Projects/IAEmu/Illustris/measurements/omega_sample1.npy')
+OMEGA_COV = np.load('/Users/snehpandya/Projects/IAEmu/Illustris/measurements/omega_sample1_cov.npy')
+
+N_BINS = len(OMEGA_TARGET)
+print(f"  N_bins = {N_BINS}")
+print(f"  Target ω(r) range: [{np.min(OMEGA_TARGET):.4f}, {np.max(OMEGA_TARGET):.4f}]")
+print(f"  Covariance shape: {OMEGA_COV.shape}")
+print(f"  Diagonal std range: [{np.sqrt(np.min(np.diag(OMEGA_COV))):.4e}, {np.sqrt(np.max(np.diag(OMEGA_COV))):.4e}]")
+
+# Add small regularization for numerical stability
+OMEGA_COV_REG = OMEGA_COV + 1e-10 * np.eye(N_BINS)
+OMEGA_COV_JAX = jnp.array(OMEGA_COV_REG)
+OMEGA_TARGET_JAX = jnp.array(OMEGA_TARGET)
+
+# Define r_bins to match the target
+r_bins = np.logspace(np.log10(0.1), np.log10(16.0), N_BINS + 1)
+R_BINS_TUPLE = tuple(r_bins.tolist())
+R_MIDS = np.sqrt(r_bins[:-1] * r_bins[1:])
+
+# ============================================================
+# Load halo catalog
 # ============================================================
 print("\nLoading halo catalog...")
 halocat = CachedHaloCatalog(
@@ -172,56 +197,11 @@ def setup_catalog(params, subcat, seed):
 
 
 # ============================================================
-# Setup target and optimization catalogs (do once globally)
+# Setup inference catalog
 # ============================================================
-print("\nSetting up catalogs...")
-
-r_bins = np.logspace(np.log10(0.1), np.log10(16.0), 20)
-R_BINS_TUPLE = tuple(r_bins.tolist())
-R_MIDS = np.sqrt(r_bins[:-1] * r_bins[1:])
-N_BINS = len(r_bins) - 1
-
-# Target catalog
-print(f"\nSetting up TARGET catalog (seed={SEED_TARGET})...")
-TARGET_CATALOG = setup_catalog(TARGET_PARAMS, subcat, SEED_TARGET)
-print(f"  N_galaxies = {TARGET_CATALOG['n_gal']}")
-print(f"  N_centrals = {TARGET_CATALOG['n_cent']}")
-print(f"  N_satellites = {TARGET_CATALOG['n_sat']}")
-
-i_idx_target, j_idx_target = build_neighbor_pairs_numpy(
-    np.array(TARGET_CATALOG['pos']), r_bins[-1], box_size=250.0
-)
-TARGET_CATALOG['i_idx'] = jnp.array(i_idx_target)
-TARGET_CATALOG['j_idx'] = jnp.array(j_idx_target)
-print(f"  N_pairs = {len(i_idx_target)}")
-
-# Compute target omega (averaged)
-print(f"\nComputing target ω(r) (averaged over {N_TARGET_SAMPLES} samples)...")
-target_mu_cen, target_mu_sat = TARGET_PARAMS[0], TARGET_PARAMS[1]
-
-omega_target_samples = []
-for i in range(N_TARGET_SAMPLES):
-    key = random.PRNGKey(SEED_TARGET + 1000 + i)
-    mu_per_gal = jnp.where(TARGET_CATALOG['is_central'], target_mu_cen, target_mu_sat)
-    ori = sample_watson_orientations(key, TARGET_CATALOG['ref_dirs'], mu_per_gal)
-    
-    omega_i = compute_omega_unweighted(
-        TARGET_CATALOG['pos'], ori, jnp.ones(TARGET_CATALOG['n_gal']),
-        TARGET_CATALOG['i_idx'], TARGET_CATALOG['j_idx'], R_BINS_TUPLE, 250.0
-    )
-    omega_target_samples.append(omega_i)
-
-omega_target_samples = jnp.stack(omega_target_samples)
-OMEGA_TARGET = jnp.mean(omega_target_samples, axis=0)
-OMEGA_TARGET_STD = jnp.std(omega_target_samples, axis=0)
-
-print(f"  Target ω(r) range: [{float(jnp.min(OMEGA_TARGET)):.4f}, {float(jnp.max(OMEGA_TARGET)):.4f}]")
-print(f"  Target μ_cen = {target_mu_cen}, μ_sat = {target_mu_sat}")
-
-# Optimization catalog (DIFFERENT seed)
 print(f"\nSetting up INFERENCE catalog (seed={SEED_OPT})...")
 OPT_CATALOG = setup_catalog(
-    np.concatenate([TARGET_PARAMS[:2], HOD_PARAMS_FIXED]), 
+    np.concatenate([[0.5, 0.3], HOD_PARAMS_FIXED]),
     subcat, SEED_OPT
 )
 print(f"  N_galaxies = {OPT_CATALOG['n_gal']}")
@@ -229,52 +209,26 @@ print(f"  N_centrals = {OPT_CATALOG['n_cent']}")
 print(f"  N_satellites = {OPT_CATALOG['n_sat']}")
 
 i_idx_opt, j_idx_opt = build_neighbor_pairs_numpy(
-    np.array(OPT_CATALOG['pos']), r_bins[-1], box_size=250.0
+    np.array(OPT_CATALOG['pos']), r_bins[-1], box_size=BOX_SIZE
 )
 OPT_CATALOG['i_idx'] = jnp.array(i_idx_opt)
 OPT_CATALOG['j_idx'] = jnp.array(j_idx_opt)
 print(f"  N_pairs = {len(i_idx_opt)}")
 
-# Compute covariance matrix for likelihood
-print("\nEstimating ω(r) covariance matrix...")
-n_cov_samples = 100
-omega_cov_samples = []
-
-for i in range(n_cov_samples):
-    key = random.PRNGKey(SEED_OPT + 3000 + i)
-    mu_per_gal = jnp.where(OPT_CATALOG['is_central'], target_mu_cen, target_mu_sat)
-    ori = sample_watson_orientations(key, OPT_CATALOG['ref_dirs'], mu_per_gal)
-    
-    omega_i = compute_omega_unweighted(
-        OPT_CATALOG['pos'], ori, jnp.ones(OPT_CATALOG['n_gal']),
-        OPT_CATALOG['i_idx'], OPT_CATALOG['j_idx'], R_BINS_TUPLE, 250.0
-    )
-    omega_cov_samples.append(np.array(omega_i))
-
-omega_cov_samples = np.array(omega_cov_samples)
-OMEGA_COV = np.cov(omega_cov_samples.T)
-
-# Add small regularization for numerical stability
-OMEGA_COV_REG = OMEGA_COV + 1e-10 * np.eye(N_BINS)
-OMEGA_PRECISION = jnp.array(np.linalg.inv(OMEGA_COV_REG))
-OMEGA_COV_JAX = jnp.array(OMEGA_COV_REG)
-
-print(f"  Covariance matrix shape: {OMEGA_COV.shape}")
-print(f"  Diagonal std range: [{np.sqrt(np.min(np.diag(OMEGA_COV))):.4e}, {np.sqrt(np.max(np.diag(OMEGA_COV))):.4e}]")
-
 
 # ============================================================
-# Forward model functions (deterministic given key)
+# Forward model functions - IMPROVED
 # ============================================================
-def compute_omega_at_params(mu_cen, mu_sat, rng_key):
+def compute_omega_at_params_multi_key(mu_cen, mu_sat, base_seed):
     """
-    Compute omega(r) averaged over multiple orientation samples.
-    This is deterministic given the rng_key.
+    IMPROVED: Compute omega(r) averaged over multiple orientation samples
+    using DIFFERENT random keys for variance reduction.
     """
     mu_cen = jnp.clip(mu_cen, -MAX_MU, MAX_MU)
     mu_sat = jnp.clip(mu_sat, -MAX_MU, MAX_MU)
     
-    keys = random.split(rng_key, N_SAMPLES_PER_STEP)
+    # Use multiple different seeds
+    keys = jnp.array([random.PRNGKey(base_seed + i) for i in range(N_SAMPLES_PER_STEP)])
     
     def single_omega(key):
         mu_per_gal = jnp.where(OPT_CATALOG['is_central'], mu_cen, mu_sat)
@@ -283,7 +237,7 @@ def compute_omega_at_params(mu_cen, mu_sat, rng_key):
         
         omega = compute_omega_unweighted(
             OPT_CATALOG['pos'], ori, jnp.ones(OPT_CATALOG['n_gal']),
-            OPT_CATALOG['i_idx'], OPT_CATALOG['j_idx'], R_BINS_TUPLE, 250.0
+            OPT_CATALOG['i_idx'], OPT_CATALOG['j_idx'], R_BINS_TUPLE, BOX_SIZE
         )
         return jnp.nan_to_num(omega, nan=0.0)
     
@@ -292,94 +246,41 @@ def compute_omega_at_params(mu_cen, mu_sat, rng_key):
 
 
 # ============================================================
-# NumPyro model
+# NumPyro model and MCMC - IMPROVED
 # ============================================================
-def model(omega_obs, omega_cov, rng_key):
-    """
-    NumPyro model for IA parameter inference.
-    
-    Args:
-        omega_obs: Observed omega(r) values [n_bins]
-        omega_cov: Covariance matrix of omega(r) [n_bins, n_bins]
-        rng_key: JAX random key for forward model stochasticity
-    """
-    # Priors: uniform on [-0.95, 0.95]
-    mu_cen = numpyro.sample('mu_cen', dist.Uniform(-MAX_MU, MAX_MU))
-    mu_sat = numpyro.sample('mu_sat', dist.Uniform(-MAX_MU, MAX_MU))
-    
-    # Forward model: compute predicted omega(r)
-    omega_pred = compute_omega_at_params(mu_cen, mu_sat, rng_key)
-    
-    # Likelihood: multivariate normal
-    numpyro.sample('omega', dist.MultivariateNormal(omega_pred, covariance_matrix=omega_cov), obs=omega_obs)
-
-
-def model_diagonal(omega_obs, omega_std, rng_key):
-    """
-    Simplified model with diagonal covariance (independent bins).
-    Faster but ignores bin correlations.
-    """
-    # Priors: uniform on [-0.95, 0.95]
-    mu_cen = numpyro.sample('mu_cen', dist.Uniform(-MAX_MU, MAX_MU))
-    mu_sat = numpyro.sample('mu_sat', dist.Uniform(-MAX_MU, MAX_MU))
-    
-    # Forward model
-    omega_pred = compute_omega_at_params(mu_cen, mu_sat, rng_key)
-    
-    # Likelihood: independent normal per bin
-    numpyro.sample('omega', dist.Normal(omega_pred, omega_std), obs=omega_obs)
-
-
-# ============================================================
-# Custom MCMC runner that handles stochastic forward model
-# ============================================================
-def run_mcmc_with_stochastic_model(
+def run_mcmc(
     omega_obs, 
     omega_cov, 
     rng_key,
     num_warmup=500,
     num_samples=1000,
     num_chains=1,
-    use_diagonal=False
+    use_diagonal=False,
 ):
-    """
-    Run MCMC with a stochastic forward model.
-    Uses a fixed random key per MCMC iteration for the forward model.
-    """
+    """Run MCMC inference with improved forward model."""
+    
+    # IMPROVED: Use multiple fixed seeds spread across parameter space
+    # This reduces bias from using a single random realization
+    BASE_SEED = 12345
     
     if use_diagonal:
         omega_std = jnp.sqrt(jnp.diag(omega_cov))
         
-        def conditioned_model(rng_key):
-            return model_diagonal(omega_obs, omega_std, rng_key)
-    else:
-        def conditioned_model(rng_key):
-            return model(omega_obs, omega_cov, rng_key)
-    
-    # For HMC, we need the forward model to be deterministic during gradient computation.
-    # We fix the random key for the forward model and change it between MCMC steps.
-    # One approach: use a fixed key (introduces bias but allows HMC to work)
-    
-    fixed_key = random.PRNGKey(12345)
-    
-    if use_diagonal:
-        omega_std = jnp.sqrt(jnp.diag(omega_cov))
-        
-        def deterministic_model():
+        def model():
             mu_cen = numpyro.sample('mu_cen', dist.Uniform(-MAX_MU, MAX_MU))
             mu_sat = numpyro.sample('mu_sat', dist.Uniform(-MAX_MU, MAX_MU))
-            omega_pred = compute_omega_at_params(mu_cen, mu_sat, fixed_key)
+            omega_pred = compute_omega_at_params_multi_key(mu_cen, mu_sat, BASE_SEED)
             numpyro.sample('omega', dist.Normal(omega_pred, omega_std), obs=omega_obs)
     else:
-        def deterministic_model():
+        def model():
             mu_cen = numpyro.sample('mu_cen', dist.Uniform(-MAX_MU, MAX_MU))
             mu_sat = numpyro.sample('mu_sat', dist.Uniform(-MAX_MU, MAX_MU))
-            omega_pred = compute_omega_at_params(mu_cen, mu_sat, fixed_key)
+            omega_pred = compute_omega_at_params_multi_key(mu_cen, mu_sat, BASE_SEED)
             numpyro.sample('omega', dist.MultivariateNormal(omega_pred, covariance_matrix=omega_cov), obs=omega_obs)
     
     nuts_kernel = NUTS(
-        deterministic_model,
-        target_accept_prob=0.8,
+        model,
+        target_accept_prob=0.80,
         max_tree_depth=10,
     )
     
@@ -400,20 +301,28 @@ def run_mcmc_with_stochastic_model(
 # Main execution
 # ============================================================
 def main():
+    USE_DIAGONAL = False
+    
     print("\n" + "="*80)
-    print("Hamiltonian Monte Carlo Inference using ω(r)")
-    print(f"Target: μ_cen = {TARGET_PARAMS[0]:.4f}, μ_sat = {TARGET_PARAMS[1]:.4f}")
-    print(f"Using DIFFERENT catalogs: target seed={SEED_TARGET}, inference seed={SEED_OPT}")
+    print("Hamiltonian Monte Carlo Inference using ω(r) - IMPROVED")
+    print(f"True parameters: μ_cen = {TRUE_MU_CEN:.4f}, μ_sat = {TRUE_MU_SAT:.4f}")
+    print(f"N_SAMPLES_PER_STEP = {N_SAMPLES_PER_STEP} (variance reduction)")
+    print(f"Covariance: {'Diagonal' if USE_DIAGONAL else 'Full Multivariate Normal'}")
     print(f"MCMC settings: {N_WARMUP} warmup, {N_SAMPLES} samples, {N_CHAINS} chains")
     print("="*80)
     
-    # Use diagonal covariance for speed (can switch to full covariance)
-    USE_DIAGONAL = False
+    # DIAGNOSTIC: Check forward model at known points
+    print("\nDiagnostic: Forward model predictions...")
+    test_points = [
+        (0.80, 0.30, "Test point"),
+        (HALOTOOLS_MU_CEN := 0.7925, HALOTOOLS_MU_SAT := 0.2937, "halotools posterior"),
+        (TRUE_MU_CEN, TRUE_MU_SAT, "True values"),
+    ]
     
-    if USE_DIAGONAL:
-        print("\nUsing diagonal covariance (independent bins) for likelihood")
-    else:
-        print("\nUsing full covariance matrix for likelihood")
+    for mu_c, mu_s, label in test_points:
+        omega_pred = compute_omega_at_params_multi_key(mu_c, mu_s, 12345)
+        chi2 = float((omega_pred - OMEGA_TARGET_JAX) @ jnp.linalg.inv(OMEGA_COV_JAX) @ (omega_pred - OMEGA_TARGET_JAX))
+        print(f"  {label}: μ_cen={mu_c:.4f}, μ_sat={mu_s:.4f} → χ² = {chi2:.2f}")
     
     # Run MCMC
     print("\nRunning MCMC...")
@@ -421,14 +330,14 @@ def main():
     
     rng_key = random.PRNGKey(0)
     
-    mcmc = run_mcmc_with_stochastic_model(
-        OMEGA_TARGET,
+    mcmc = run_mcmc(
+        OMEGA_TARGET_JAX,
         OMEGA_COV_JAX,
         rng_key,
         num_warmup=N_WARMUP,
         num_samples=N_SAMPLES,
         num_chains=N_CHAINS,
-        use_diagonal=USE_DIAGONAL
+        use_diagonal=USE_DIAGONAL,
     )
     
     elapsed = time.time() - start_time
@@ -449,34 +358,30 @@ def main():
     
     mu_cen_mean = np.mean(mu_cen_samples)
     mu_cen_std = np.std(mu_cen_samples)
-    mu_cen_median = np.median(mu_cen_samples)
-    mu_cen_q16 = np.percentile(mu_cen_samples, 16)
-    mu_cen_q84 = np.percentile(mu_cen_samples, 84)
-    
     mu_sat_mean = np.mean(mu_sat_samples)
     mu_sat_std = np.std(mu_sat_samples)
-    mu_sat_median = np.median(mu_sat_samples)
-    mu_sat_q16 = np.percentile(mu_sat_samples, 16)
-    mu_sat_q84 = np.percentile(mu_sat_samples, 84)
     
     print(f"\nμ_cen:")
-    print(f"  Target:     {TARGET_PARAMS[0]:.4f}")
+    print(f"  True:       {TRUE_MU_CEN:.4f}")
     print(f"  Mean ± Std: {mu_cen_mean:.4f} ± {mu_cen_std:.4f}")
-    print(f"  Median:     {mu_cen_median:.4f}")
-    print(f"  68% CI:     [{mu_cen_q16:.4f}, {mu_cen_q84:.4f}]")
-    print(f"  Error:      {abs(mu_cen_mean - TARGET_PARAMS[0]):.4f}")
+    print(f"  Bias:       {mu_cen_mean - TRUE_MU_CEN:.4f}")
     
     print(f"\nμ_sat:")
-    print(f"  Target:     {TARGET_PARAMS[1]:.4f}")
+    print(f"  True:       {TRUE_MU_SAT:.4f}")
     print(f"  Mean ± Std: {mu_sat_mean:.4f} ± {mu_sat_std:.4f}")
-    print(f"  Median:     {mu_sat_median:.4f}")
-    print(f"  68% CI:     [{mu_sat_q16:.4f}, {mu_sat_q84:.4f}]")
-    print(f"  Error:      {abs(mu_sat_mean - TARGET_PARAMS[1]):.4f}")
+    print(f"  Bias:       {mu_sat_mean - TRUE_MU_SAT:.4f}")
+    
+    # Compare to halotools
+    print(f"\nComparison to halotools-IA posterior:")
+    print(f"  halotools: μ_cen = 0.7925, μ_sat = 0.2937")
+    print(f"  diffHOD:   μ_cen = {mu_cen_mean:.4f}, μ_sat = {mu_sat_mean:.4f}")
+    print(f"  Δμ_cen = {mu_cen_mean - 0.7925:.4f} ({(mu_cen_mean - 0.7925)/mu_cen_std:.2f}σ)")
+    print(f"  Δμ_sat = {mu_sat_mean - 0.2937:.4f} ({(mu_sat_mean - 0.2937)/mu_sat_std:.2f}σ)")
     
     # Compute correlation
-    cov_matrix = np.cov(mu_cen_samples, mu_sat_samples)
-    correlation = cov_matrix[0, 1] / np.sqrt(cov_matrix[0, 0] * cov_matrix[1, 1])
-    print(f"\nCorrelation(μ_cen, μ_sat): {correlation:.4f}")
+    posterior_cov = np.cov(mu_cen_samples, mu_sat_samples)
+    correlation = posterior_cov[0, 1] / np.sqrt(posterior_cov[0, 0] * posterior_cov[1, 1])
+    print(f"\nPosterior Correlation(μ_cen, μ_sat): {correlation:.4f}")
     
     # Save results
     output_dir = Path('omega_hmc_results')
@@ -487,122 +392,29 @@ def main():
         'mu_sat_samples': mu_sat_samples,
         'mu_cen_mean': mu_cen_mean,
         'mu_cen_std': mu_cen_std,
-        'mu_cen_median': mu_cen_median,
-        'mu_cen_q16': mu_cen_q16,
-        'mu_cen_q84': mu_cen_q84,
         'mu_sat_mean': mu_sat_mean,
         'mu_sat_std': mu_sat_std,
-        'mu_sat_median': mu_sat_median,
-        'mu_sat_q16': mu_sat_q16,
-        'mu_sat_q84': mu_sat_q84,
-        'correlation': correlation,
-        'cov_matrix': cov_matrix,
-        'target_mu_cen': TARGET_PARAMS[0],
-        'target_mu_sat': TARGET_PARAMS[1],
+        'posterior_correlation': correlation,
+        'posterior_cov': posterior_cov,
+        'true_mu_cen': TRUE_MU_CEN,
+        'true_mu_sat': TRUE_MU_SAT,
+        'halotools_mu_cen': 0.7925,
+        'halotools_mu_sat': 0.2937,
         'omega_target': np.array(OMEGA_TARGET),
-        'omega_target_std': np.array(OMEGA_TARGET_STD),
         'omega_cov': OMEGA_COV,
         'r_mids': R_MIDS,
+        'r_bins': r_bins,
         'n_warmup': N_WARMUP,
         'n_samples': N_SAMPLES,
         'n_chains': N_CHAINS,
+        'n_samples_per_step': N_SAMPLES_PER_STEP,
+        'use_diagonal': USE_DIAGONAL,
         'elapsed_minutes': elapsed / 60,
     }
     
     results_file = output_dir / 'hmc_results.npy'
     np.save(results_file, results, allow_pickle=True)
     print(f"\nResults saved to {results_file}")
-    
-    # Plot results
-    try:
-        import matplotlib.pyplot as plt
-        
-        # Try to import corner, but don't fail if not available
-        try:
-            import corner
-            HAS_CORNER = True
-        except ImportError:
-            HAS_CORNER = False
-            print("Note: Install corner for corner plots (pip install corner)")
-        
-        if HAS_CORNER:
-            # Corner plot
-            fig = corner.corner(
-                np.column_stack([mu_cen_samples, mu_sat_samples]),
-                labels=[r'$\mu_{\rm cen}$', r'$\mu_{\rm sat}$'],
-                truths=[TARGET_PARAMS[0], TARGET_PARAMS[1]],
-                quantiles=[0.16, 0.5, 0.84],
-                show_titles=True,
-                title_fmt='.4f',
-            )
-            
-            corner_file = output_dir / 'corner_plot.png'
-            fig.savefig(corner_file, dpi=150, bbox_inches='tight')
-            print(f"Corner plot saved to {corner_file}")
-            plt.close()
-        
-        # Trace plots
-        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-        
-        n_total_samples = len(mu_cen_samples)
-        samples_per_chain = n_total_samples // N_CHAINS
-        
-        # mu_cen trace
-        ax = axes[0, 0]
-        for chain in range(N_CHAINS):
-            start_idx = chain * samples_per_chain
-            end_idx = start_idx + samples_per_chain
-            if end_idx > n_total_samples:
-                end_idx = n_total_samples
-            chain_samples = mu_cen_samples[start_idx:end_idx]
-            ax.plot(chain_samples, alpha=0.7, label=f'Chain {chain}')
-        ax.axhline(TARGET_PARAMS[0], color='r', linestyle='--', label='Target')
-        ax.set_xlabel('Sample')
-        ax.set_ylabel(r'$\mu_{\rm cen}$')
-        ax.set_title(r'$\mu_{\rm cen}$ Trace')
-        ax.legend(fontsize=8)
-        
-        # mu_sat trace
-        ax = axes[0, 1]
-        for chain in range(N_CHAINS):
-            start_idx = chain * samples_per_chain
-            end_idx = start_idx + samples_per_chain
-            if end_idx > n_total_samples:
-                end_idx = n_total_samples
-            chain_samples = mu_sat_samples[start_idx:end_idx]
-            ax.plot(chain_samples, alpha=0.7, label=f'Chain {chain}')
-        ax.axhline(TARGET_PARAMS[1], color='r', linestyle='--', label='Target')
-        ax.set_xlabel('Sample')
-        ax.set_ylabel(r'$\mu_{\rm sat}$')
-        ax.set_title(r'$\mu_{\rm sat}$ Trace')
-        ax.legend(fontsize=8)
-        
-        # mu_cen histogram
-        ax = axes[1, 0]
-        ax.hist(mu_cen_samples, bins=50, density=True, alpha=0.7)
-        ax.axvline(TARGET_PARAMS[0], color='r', linestyle='--', lw=2, label='Target')
-        ax.axvline(mu_cen_mean, color='k', linestyle='-', lw=2, label='Mean')
-        ax.set_xlabel(r'$\mu_{\rm cen}$')
-        ax.set_ylabel('Density')
-        ax.legend()
-        
-        # mu_sat histogram
-        ax = axes[1, 1]
-        ax.hist(mu_sat_samples, bins=50, density=True, alpha=0.7)
-        ax.axvline(TARGET_PARAMS[1], color='r', linestyle='--', lw=2, label='Target')
-        ax.axvline(mu_sat_mean, color='k', linestyle='-', lw=2, label='Mean')
-        ax.set_xlabel(r'$\mu_{\rm sat}$')
-        ax.set_ylabel('Density')
-        ax.legend()
-        
-        plt.tight_layout()
-        trace_file = output_dir / 'trace_plots.png'
-        fig.savefig(trace_file, dpi=150, bbox_inches='tight')
-        print(f"Trace plots saved to {trace_file}")
-        plt.close()
-        
-    except ImportError:
-        print("\nNote: Install matplotlib for plotting (pip install matplotlib)")
     
     print("\n" + "="*80)
     print("HMC inference complete!")

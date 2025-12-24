@@ -23,7 +23,7 @@ print(f"JAX devices: {jax.devices()}")
 # ============================================================
 # Configuration
 # ============================================================
-TARGET_PARAMS = np.asarray([0.78, 0.33, 12.02, 0.26, 11.38, 13.31, 1.06])
+TARGET_PARAMS = np.asarray([0.79, 0.30, 12.02, 0.26, 11.38, 13.31, 1.06])
 BASE_PARAMS = jnp.array([0.0, 0.0, 12.02, 0.26, 11.38, 13.31, 1.0], dtype=jnp.float32)
 
 N_PARALLEL_RUNS = 50  # Number of parallel optimizations
