@@ -12,16 +12,15 @@ import jax
 from halotools.sim_manager import CachedHaloCatalog
 
 # Assuming diffHalotoolsIA.py is in the same directory or on PYTHONPATH
-from diffHalotoolsIA import DiffHalotoolsIA
+from jax_diffhodIA_weighted import DiffHalotoolsIA
+from diffhodIA_utils import (
+    load_cleaned_catalogs_from_h5,
+    mask_bad_halocat,
+    plot_diagnostic,
+)
 
 # Target HOD parameters: [mu_cen, mu_sat, logMmin, sigma_logM, logM0, logM1, alpha]
 TARGET_PARAMS = np.asarray([0.79, 0.30, 12.54, 0.26, 12.68, 13.48, 1.0])
-
-
-def mask_bad_halocat(halocat):
-    """Remove halos with invalid axis ratios."""
-    mask = (halocat.halo_table["halo_b_to_a"] > 0) & (halocat.halo_table["halo_b_to_a"] <= 1)
-    halocat.halo_table = halocat.halo_table[mask]
 
 
 def main():
@@ -37,12 +36,22 @@ def main():
         version_name="halotools_v0p4",
     )
     mask_bad_halocat(halocat)
-    
-    subcat = halocat.halo_table[[
-        "halo_id", "halo_upid", "halo_mvir", "halo_x", "halo_y", "halo_z",
-        "halo_axisA_x", "halo_axisA_y", "halo_axisA_z", "halo_rvir",
-        "halo_hostid", "halo_b_to_a",
-    ]]
+    subcat = halocat.halo_table[
+        [
+            "halo_id",
+            "halo_upid",
+            "halo_mvir",
+            "halo_x",
+            "halo_y",
+            "halo_z",
+            "halo_axisA_x",
+            "halo_axisA_y",
+            "halo_axisA_z",
+            "halo_rvir",
+            "halo_hostid",
+            "halo_b_to_a",
+        ]
+    ]
     print(f"Loaded {len(subcat)} halos")
     
     # Initialize builder (one-time setup, not timed for HOD)
